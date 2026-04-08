@@ -20,13 +20,15 @@ func NewServer(log *zap.Logger, workers []wrks.Worker, port string) *Server {
 	m := http.NewServeMux()
 
 	if workers == nil {
-		workers = make([]wrks.Worker, 0, 1)
+		workers = make([]wrks.Worker, 0, 3)
 	}
 	if port == "" {
 		port = ":8080"
 	}
 
 	workers = append(workers, wrks.NewTranslate(log))
+	workers = append(workers, wrks.NewSTT(log))
+	workers = append(workers, wrks.NewTTS(log))
 
 	for i, wrk := range workers {
 		wrk.Register(m)
@@ -43,6 +45,8 @@ func NewServer(log *zap.Logger, workers []wrks.Worker, port string) *Server {
 	}
 }
 
+// ListenAndServe starts the server
+// Send log info on starting
 func (s *Server) ListenAndServe() error {
 	s.log.Info("Starting server",
 		zap.String("port", s.Srv.Addr))

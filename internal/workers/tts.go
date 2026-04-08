@@ -1,6 +1,6 @@
-// Package workers contains worker implementations for translate
-// Translate text from one language to another
-// Returned text is in the target language
+// Package workers contains worker implementations for text to speech
+// Text to speech
+// Returned bytes are audio data
 package workers
 
 import (
@@ -11,9 +11,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// Translate struct for implementing worker
-// Contains 'translate' endpoint for translating text
-type Translate struct {
+// TTS struct for implementing worker
+// Contains 'tts' endpoint for make audio from text
+type TTS struct {
 	Name   string
 	log    *zap.Logger
 	upg    websocket.Upgrader
@@ -21,16 +21,16 @@ type Translate struct {
 	cancel context.CancelFunc
 }
 
-// NewTranslate creates a new Translate worker
-func NewTranslate(log *zap.Logger) *Translate {
+// NewTTS creates a new TTS worker
+func NewTTS(log *zap.Logger) *TTS {
 	ctx, cancel := context.WithCancel(context.Background())
 	upg := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
 	}
-	return &Translate{
-		Name:   "Translate",
+	return &TTS{
+		Name:   "TTS",
 		log:    log,
 		upg:    upg,
 		ctx:    ctx,
@@ -40,26 +40,26 @@ func NewTranslate(log *zap.Logger) *Translate {
 
 // GetName returns the name of the worker
 // Used for logging
-func (t *Translate) GetName() string {
+func (t *TTS) GetName() string {
 	return t.Name
 }
 
 // Register the worker endpoints on the http.ServeMux
-func (t *Translate) Register(m *http.ServeMux) {
-	m.HandleFunc("/translate", t.Translate)
+func (t *TTS) Register(m *http.ServeMux) {
+	m.HandleFunc("/tts", t.TTS)
 }
 
 // Close cancels the context
 // Cancel context is used for shutdown WS connections
-func (t *Translate) Close(ctx context.Context) {
+func (t *TTS) Close(ctx context.Context) {
 	t.cancel()
 }
 
-// Translate translates text from one language to another
+// TTS makes audio from text
 // Use WebSockets for streaming
-// Returned text is in the target language
-func (t *Translate) Translate(w http.ResponseWriter, r *http.Request) {
-	t.log.Info("Translate request")
+// Returned bytes are audio data
+func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
+	t.log.Info("TTS request")
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {
