@@ -6,9 +6,9 @@ package workers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"unsafe"
 
@@ -25,16 +25,20 @@ const (
 // Translator struct for implementing worker
 // Contains 'translate' endpoint for translating text
 type Translator struct {
-	Name   string
-	log    *zap.Logger
-	upg    websocket.Upgrader
-	trl    *etrl.EasyTranslate
-	ctx    context.Context
-	cancel context.CancelFunc
+	// Name of the worker
+	Name string
+
+	// Preferred language. Used when no syntax 'from to' in first message
+	prefLang string
+	log      *zap.Logger
+	upg      websocket.Upgrader
+	trl      *etrl.EasyTranslate
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
-// NewTranslate creates a new Translate worker
-func NewTranslate(log *zap.Logger) *Translator {
+// NewTranslator creates a new Translate worker
+func NewTranslator(log *zap.Logger) *Translator {
 	ctx, cancel := context.WithCancel(context.Background())
 	upg := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -45,7 +49,7 @@ func NewTranslate(log *zap.Logger) *Translator {
 	translator := etrl.NewEasyTranslate(defaultDicts)
 
 	return &Translator{
-		Name:   "Translate",
+		Name:   "Translator",
 		log:    log,
 		upg:    upg,
 		trl:    translator,
@@ -63,6 +67,7 @@ func (t *Translator) GetName() string {
 // Register the worker endpoints on the http.ServeMux
 func (t *Translator) Register(m *http.ServeMux) {
 	m.HandleFunc("/translate", t.Translate)
+	m.HandleFunc("/translate/setPrefferedLanguage", t.setPref)
 }
 
 // Close cancels the context
@@ -71,12 +76,41 @@ func (t *Translator) Close(ctx context.Context) {
 	t.cancel()
 }
 
+// setPref sets preferred language
+// Used as default language for translating text
+func (t *Translator) setPref(w http.ResponseWriter, r *http.Request) {
+	const op = "translator.setPref"
+
+	var req struct {
+		PrefLang string `json:"language"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		t.log.Error("Failed to decode request",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to decode request",
+			http.StatusInternalServerError)
+		return
+	}
+
+	t.prefLang = req.PrefLang
+
+	t.log.Info("Set preferred language",
+		zap.String("op", op),
+		zap.String("prefLang", req.PrefLang))
+
+	w.WriteHeader(http.StatusOK)
+}
+
 // Translate translates text from one language to another.
 // First message must be 'from to'. Like: 'en ru'
 // Use WebSockets for streaming.
 // Returned text is in the target language.
 func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 	const op = "translator.translate"
+
+	lock := true
 
 	t.log.Info("Translate request",
 		zap.String("op", op))
@@ -96,7 +130,17 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 	inCom := etrl.NewRingBuffer(defaultLength)
 	outCom := etrl.NewRingBuffer(defaultLength)
 
-	dict, err := t.prepareTranslator(conn)
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.log.Error("Failed to read message",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to read message",
+			http.StatusInternalServerError)
+		return
+	}
+
+	dict, err := t.prepareTranslator(msg)
 	if err != nil {
 		t.log.Error("Failed to prepare translator",
 			zap.String("op", op),
@@ -110,9 +154,11 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 		zap.String("op", op),
 		zap.String("dict", dict))
 
+	inCom.Write(msg)
+
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if err := t.trl.StartTranslate(t.ctx, inCom, dict, func(data []byte) {
+		if err := t.trl.StartTranslate(t.ctx, inCom, dict, defaultLength, func(data []byte) {
 			t.log.Debug("Received translated text",
 				zap.String("op", op),
 				zap.String("text", unsafe.String(unsafe.SliceData(data), len(data))))
@@ -134,28 +180,29 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 			inCom.Close()
 			return
 		default:
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				t.log.Error("Failed to read message",
+			if !lock {
+				_, msg, err = conn.ReadMessage()
+				if err != nil {
+					t.log.Error("Failed to read message",
+						zap.String("op", op),
+						zap.Error(err))
+					return
+				}
+
+				t.log.Debug("Received message",
 					zap.String("op", op),
-					zap.Error(err))
-				return
+					zap.String("message", unsafe.String(unsafe.SliceData(msg), len(msg))))
+
+				inCom.Write(msg)
 			}
-
-			t.log.Debug("Received message",
-				zap.String("op", op),
-				zap.String("message", unsafe.String(unsafe.SliceData(msg), len(msg))))
-
-			inCom.Write(msg)
 			cut := outCom.Read(data)
 			if cut <= 0 {
 				t.log.Error("Failed to read translated text",
 					zap.String("op", op))
 				return
 			}
-			data = data[:cut]
 
-			err = conn.WriteMessage(websocket.TextMessage, data)
+			err = conn.WriteMessage(websocket.TextMessage, data[:cut])
 			if err != nil {
 				t.log.Error("Failed to write message",
 					zap.String("op", op),
@@ -165,34 +212,57 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 
 			t.log.Debug("Sent message",
 				zap.String("op", op),
-				zap.String("message", string(data)))
+				zap.String("message", unsafe.String(unsafe.SliceData(data[:cut]), len(data[:cut]))))
+
+			lock = false
 		}
 	}
 }
 
 // prepareTranslator prepares the easyTranslator package for translating
 // First message must be 'from to'. Like: 'en ru'
-func (t *Translator) prepareTranslator(conn *websocket.Conn) (string, error) {
+func (t *Translator) prepareTranslator(msg []byte) (string, error) {
 	const op = "translator.prepareTranslator"
-
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
-		return "", fmt.Errorf("%s: read first message: %w", op, err)
-	}
 
 	from, to, ok := bytes.Cut(msg, []byte(" "))
 	if !ok {
-		return "", fmt.Errorf("%s: failed to cut message. Needed format: 'source to'", op)
+		dict, err := t.prepareWithDetect(msg)
+		if err != nil {
+			return "", fmt.Errorf("%s: failed to prepare translator: %w", op, err)
+		}
+		return dict, nil
 	}
 
 	fromStr := unsafe.String(unsafe.SliceData(from), len(from))
 	toStr := unsafe.String(unsafe.SliceData(to), len(to))
 
-	if err := t.trl.EnsureTranslator(fromStr, toStr, defaultLength); err != nil {
-		return "", fmt.Errorf("%s: ensure translator: %w", op, err)
+	dict, err := t.trl.EnsureTranslator(fromStr, toStr, defaultLength)
+	if err != nil {
+		dict, err = t.prepareWithDetect(msg)
+		if err != nil {
+			return "", fmt.Errorf("%s: failed to prepare translator: %w", op, err)
+		}
 	}
 
-	dict := strings.ToLower(fromStr + "_" + toStr)
+	return dict, nil
+}
+
+// prepareWithDetect is a fallback fucntion for prepareTranslator.
+// It tries to detect language and prepare it.
+// For target language it uses the preferred language.
+func (t *Translator) prepareWithDetect(msg []byte) (string, error) {
+	const op = "translator.prepareWithDetect"
+
+	sourceStr := unsafe.String(unsafe.SliceData(msg), len(msg))
+
+	if t.prefLang == "" {
+		return "", fmt.Errorf("%s: no preferred language", op)
+	}
+
+	dict, err := t.trl.DetectWithEnsure(sourceStr, t.prefLang)
+	if err != nil {
+		return "", fmt.Errorf("%s: failed to detect language: %w", op, err)
+	}
 
 	return dict, nil
 }

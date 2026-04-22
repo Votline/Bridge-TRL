@@ -26,7 +26,7 @@ func NewServer(log *zap.Logger, workers []wrks.Worker, port string) *Server {
 		port = ":8080"
 	}
 
-	workers = append(workers, wrks.NewTranslate(log))
+	workers = append(workers, wrks.NewTranslator(log))
 	workers = append(workers, wrks.NewSTT(log))
 	workers = append(workers, wrks.NewTTS(log))
 
