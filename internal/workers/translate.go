@@ -17,11 +17,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	defaultLength = 4096
-	defaultDicts  = "dicts/"
-)
-
 // Translator struct for implementing worker
 // Contains 'translate' endpoint for translating text
 type Translator struct {

@@ -1,4 +1,4 @@
-// Package workers contains worker implementations for speech to text
+// Package workers stt.go contains worker implementations for speech to text
 // Speech to text
 // Returned text is in the source language
 package workers
@@ -14,6 +14,7 @@ import (
 // STT struct for implementing worker
 // Contains 'stt' endpoint for speech to text
 type STT struct {
+	// Name of the worker
 	Name   string
 	log    *zap.Logger
 	upg    websocket.Upgrader

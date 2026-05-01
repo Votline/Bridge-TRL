@@ -29,6 +29,7 @@ func NewServer(log *zap.Logger, workers []wrks.Worker, port string) *Server {
 	workers = append(workers, wrks.NewTranslator(log))
 	workers = append(workers, wrks.NewSTT(log))
 	workers = append(workers, wrks.NewTTS(log))
+	workers = append(workers, wrks.NewInflector(log))
 
 	for i, wrk := range workers {
 		wrk.Register(m)

@@ -6,6 +6,11 @@ import (
 	"net/http"
 )
 
+const (
+	defaultLength = 512
+	defaultDicts  = "dicts/"
+)
+
 // Worker is an interface for workers.
 // You can use it for custom endpoints.
 type Worker interface {

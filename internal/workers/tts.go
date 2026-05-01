@@ -1,4 +1,4 @@
-// Package workers contains worker implementations for text to speech
+// Package workers tts.go contains worker implementations for text to speech
 // Text to speech
 // Returned bytes are audio data
 package workers
@@ -14,6 +14,7 @@ import (
 // TTS struct for implementing worker
 // Contains 'tts' endpoint for make audio from text
 type TTS struct {
+	// Name of the worker
 	Name   string
 	log    *zap.Logger
 	upg    websocket.Upgrader
