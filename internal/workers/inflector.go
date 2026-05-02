@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -303,6 +305,10 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 						zap.String("tran", unsafe.String(unsafe.SliceData(tranFinal), len(tranFinal))))
 				}
 
+				t.log.Info("Send inflected text",
+					zap.String("op", op),
+					zap.String("inflected", unsafe.String(unsafe.SliceData(inflected), len(inflected))))
+
 				err = conn.WriteMessage(websocket.TextMessage, inflected)
 				if err != nil {
 					t.log.Error("Failed to write message", zap.Error(err))
@@ -327,6 +333,7 @@ func (t *Inflector) parseOptions() error {
 		return fmt.Errorf("%s: call is empty", op)
 	}
 
+	t.mode = inflectorModeAPI
 	if !strings.HasPrefix(t.call, "http") {
 		t.mode = inflectorModeScript
 		return nil
@@ -351,24 +358,7 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 	origStr := unsafe.String(unsafe.SliceData(orig), len(orig))
 	tranStr := unsafe.String(unsafe.SliceData(tran), len(tran))
 
-	url := t.call
-	body := RequestBody{
-		Model:  t.model,
-		System: prompt,
-		Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
-		Stream: false,
-		Options: Options{
-			Temperature:   0.1,
-			NumPredict:    512,
-			TopP:          0.9,
-			RepeatPenalty: 1.1,
-		},
-	}
-
-	jsonData, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
-	}
+	call := t.call
 
 	if t.client == nil {
 		client := &http.Client{
@@ -379,46 +369,63 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 
 	switch t.mode {
 	case inflectorModeScript:
-	case inflectorModeAPI:
-
-		t.log.Info("Send request",
-			zap.String("op", op),
-			zap.String("url", url),
-			zap.String("body", fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr)))
-
-		resp, err := t.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+		payload := map[string]string{
+			"original":   origStr,
+			"translated": tranStr,
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s: request failed, status: %d", op, resp.StatusCode)
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+		}
+
+		resBytes, err := t.callScript(call, jsonData)
+		if err != nil {
+			return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
 		}
 
 		var res struct {
 			Response string `json:"response"`
 		}
 
-		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-			return nil, fmt.Errorf("%s: failed to decode response body: %w", op, err)
+		if err := json.Unmarshal(resBytes, &res); err != nil {
+			return nil, fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
 		}
 
-		t.log.Info("Received response",
-			zap.String("op", op),
-			zap.String("response", res.Response))
-
-		resBytes := unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
+		resBytes = unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
 		trimSpaceBytes(&resBytes)
 
+		return resBytes, nil
+
+	case inflectorModeAPI:
+		body := RequestBody{
+			Model:  t.model,
+			System: prompt,
+			Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
+			Stream: false,
+			Options: Options{
+				Temperature:   0.1,
+				NumPredict:    512,
+				TopP:          0.9,
+				RepeatPenalty: 1.1,
+			},
+		}
+
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+		}
+
+		resBytes, err := t.callAPI(call, jsonData, origStr, tranStr)
+		if err != nil {
+			return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+		}
 		return resBytes, nil
 
 	default:
 		t.log.Error("Unknown mode", zap.Int("mode", t.mode))
 		return nil, fmt.Errorf("%s: unknown mode: %d", op, t.mode)
 	}
-
-	return nil, nil
 }
 
 // trimSpaceBytes trims spaces from data by pointer
@@ -441,4 +448,87 @@ func trimSpaceBytes(b *[]byte) {
 // isSpace returns true if byte is space
 func isSpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// sendHTTP sends text for inflecting to the server
+// return inflicted text and error
+func (t *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string) ([]byte, error) {
+	const op = "inflector.sendAI"
+
+	t.log.Info("Send request",
+		zap.String("op", op),
+		zap.String("url", url),
+		zap.String("body", fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr)))
+
+	resp, err := t.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: request failed, status: %d", op, resp.StatusCode)
+	}
+
+	var res struct {
+		Response string `json:"response"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("%s: failed to decode response body: %w", op, err)
+	}
+
+	t.log.Info("Received response",
+		zap.String("op", op),
+		zap.String("response", res.Response))
+
+	resBytes := unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
+	trimSpaceBytes(&resBytes)
+
+	return resBytes, nil
+}
+
+func (t *Inflector) callScript(scriptCall string, jsonData []byte) ([]byte, error) {
+	const op = "inflector.callScript"
+
+	t.log.Info("Call script",
+		zap.String("op", op),
+		zap.String("script call", scriptCall))
+
+	parts := strings.Split(scriptCall, " ")
+
+	cmd := exec.Command(parts[0], parts[1:]...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to get stdin pipe: %w", op, err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to get stdout pipe: %w", op, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("%s: failed to start script: %w", op, err)
+	}
+
+	if _, err := stdin.Write(jsonData); err != nil {
+		return nil, fmt.Errorf("%s: failed to write to stdin: %w", op, err)
+	}
+
+	if err := stdin.Close(); err != nil {
+		return nil, fmt.Errorf("%s: failed to close stdin: %w", op, err)
+	}
+
+	resBytes, err := io.ReadAll(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to read stdout: %w", op, err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("%s: failed to wait for script: %w", op, err)
+	}
+
+	return resBytes, nil
 }

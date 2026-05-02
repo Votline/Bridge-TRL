@@ -1,9 +1,0 @@
-[http]
-URL:http://localhost:8080/translate/setPrefferedLanguage
-Body:{"language": "ru"}
-Type:http
-[\http]
-[ws]
-URL:while:ws://localhost:8080/translate
-Type:http
-[\ws]
