@@ -64,14 +64,6 @@ Constraints:
 5. The output MUST be in the same language as the TRANSLATION.`
 )
 
-// bufPool is a pool for buffers
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, defaultLength)
-		return &b
-	},
-}
-
 // Inflector struct for implementing worker
 // Contains 'tts' endpoint for make audio from text
 type Inflector struct {
@@ -152,7 +144,7 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Call        string `json:"call"`
 		Model       string `json:"model"`
-		ReadTimeout int    `json:"readTimeout"`
+		ReadTimeout int    `json:"read_timeout"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -181,7 +173,9 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("Set options",
 		zap.String("op", op),
-		zap.String("call", req.Call))
+		zap.String("call", req.Call),
+		zap.String("model", req.Model),
+		zap.String("readTimeout", fmt.Sprintf("%d", req.ReadTimeout)))
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -193,6 +187,8 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	const op = "inflector.Inflector"
 
 	t.log.Info("Inflector request")
+
+	t.ctx = r.Context()
 
 	if err := t.parseOptions(); err != nil {
 		t.log.Error("Failed to parse options",
@@ -215,9 +211,6 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	t.log.Info("Upgraded connection")
-
-	// origBuf := rBufPool.Get().(*etrl.RingBuffer)
-	// tranBuf := rBufPool.Get().(*etrl.RingBuffer)
 
 	origBuf := etrl.NewRingBuffer(defaultLength)
 	tranBuf := etrl.NewRingBuffer(defaultLength)
@@ -245,6 +238,8 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 						zap.Error(err))
 					return
 				}
+
+				// TODO: custom json parser instead of json
 
 				origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
 				tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
