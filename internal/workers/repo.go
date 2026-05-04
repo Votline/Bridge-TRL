@@ -2,9 +2,11 @@
 package workers
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"sync"
+	"unsafe"
 )
 
 const (
@@ -34,4 +36,17 @@ type Worker interface {
 	GetName() string
 	Register(m *http.ServeMux)
 	Close(ctx context.Context)
+}
+
+func findAPIPrefix(d string) bool {
+	data := unsafe.Slice(unsafe.StringData(d), len(d))
+
+	has := bytes.Index(data, []byte("http"))
+	if has == -1 {
+		has = bytes.Index(data, []byte("https"))
+		if has == -1 {
+			return false
+		}
+	}
+	return true
 }

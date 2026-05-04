@@ -6,6 +6,7 @@ package workers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -156,17 +157,24 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t.call = req.Call
 	t.model = req.Model
 
 	if req.ReadTimeout == 0 {
 		req.ReadTimeout = 2
 	}
 
+	t.mode = inflectorModeAPI
+	if has := findAPIPrefix(req.Call); !has {
+		t.mode = inflectorModeScript
+	}
+
 	t.readTimeout = time.Duration(req.ReadTimeout) * time.Second
 
 	client := &http.Client{
 		Timeout: t.readTimeout,
+	}
+	client.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
 	t.client = client
@@ -189,15 +197,6 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	t.log.Info("Inflector request")
 
 	t.ctx = r.Context()
-
-	if err := t.parseOptions(); err != nil {
-		t.log.Error("Failed to parse options",
-			zap.String("op", op),
-			zap.Error(err))
-		http.Error(w, "Failed to parse options",
-			http.StatusInternalServerError)
-		return
-	}
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {
@@ -317,29 +316,6 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	})
 
 	wg.Wait()
-}
-
-// parseOptions parses options of the worker
-// Sets mode of the worker
-func (t *Inflector) parseOptions() error {
-	const op = "inflector.parseOptions"
-
-	if t.call == "" {
-		return fmt.Errorf("%s: call is empty", op)
-	}
-
-	t.mode = inflectorModeAPI
-	if !strings.HasPrefix(t.call, "http") {
-		t.mode = inflectorModeScript
-		return nil
-	}
-
-	if t.model == "" || strings.HasPrefix(t.model, "http") {
-		return fmt.Errorf("%s: model is empty", op)
-	}
-
-	t.mode = inflectorModeAPI
-	return nil
 }
 
 // sendInflect sends inflected text to the server
@@ -524,6 +500,8 @@ func (t *Inflector) callScript(scriptCall string, jsonData []byte) ([]byte, erro
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("%s: failed to wait for script: %w", op, err)
 	}
+
+	trimSpaceBytes(&resBytes)
 
 	return resBytes, nil
 }

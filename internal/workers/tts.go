@@ -6,6 +6,7 @@ package workers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -158,7 +159,7 @@ func (t *TTS) setOptions(w http.ResponseWriter, r *http.Request) {
 	t.modelName = req.ModelName
 
 	t.mode = ttsModeAPI
-	if !strings.HasPrefix(t.call, "http") {
+	if ok := findAPIPrefix(t.call); !ok {
 		t.mode = ttsModeScript
 	}
 
@@ -170,6 +171,9 @@ func (t *TTS) setOptions(w http.ResponseWriter, r *http.Request) {
 
 	client := &http.Client{
 		Timeout: t.readTimeout,
+	}
+	client.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
 	t.client = client
@@ -277,6 +281,13 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 
 					}
 				case ttsModeAPI:
+					bytesPCM, err = t.callAPI(t.call, textBuf)
+					if err != nil {
+						t.log.Error("Failed to call API",
+							zap.String("op", op),
+							zap.Error(err))
+						return
+					}
 				}
 
 				t.log.Info("Got data",
@@ -379,6 +390,55 @@ func (t *TTS) callScript(scriptCall string, textBuf []byte) ([]byte, error) {
 	t.log.Info("Script finished",
 		zap.String("op", op),
 		zap.Int("res length", len(resBytes)))
+
+	return resBytes, nil
+}
+
+func (t *TTS) callAPI(url string, textBuf []byte) ([]byte, error) {
+	const op = "tts.callAPI"
+
+	t.log.Info("Call API",
+		zap.String("op", op),
+		zap.String("url", url))
+
+	req := struct {
+		Text      string `json:"text"`
+		VoiceID   string `json:"voice_id"`
+		ModelName string `json:"model_name"`
+	}{
+		Text:      unsafe.String(unsafe.SliceData(textBuf), len(textBuf)),
+		VoiceID:   t.voiceID,
+		ModelName: t.modelName,
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+	}
+
+	resp, err := t.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: request failed, status: %d", op, resp.StatusCode)
+	}
+
+	var res struct {
+		WAV string `json:"wav"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("%s: failed to decode response body: %w", op, err)
+	}
+
+	t.log.Info("Received response",
+		zap.String("op", op),
+		zap.Int("res length", len(res.WAV)))
+
+	resBytes := unsafe.Slice(unsafe.StringData(res.WAV), len(res.WAV))
 
 	return resBytes, nil
 }
