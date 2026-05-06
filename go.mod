@@ -10,6 +10,7 @@ require (
 
 require (
 	github.com/Votline/Go-audio v1.0.1-0.20260415123656-a38b9c6101c7 // indirect
+	github.com/alphacep/vosk-api/go v0.3.50 // indirect
 	github.com/gordonklaus/portaudio v0.0.0-20260203164431-765aa7dfa631 // indirect
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect

@@ -2,6 +2,8 @@ github.com/Votline/EasyTranslate v1.0.0 h1:C1a277meuG/cPqwijXNPVDmLEInrOZ4ggvwZB
 github.com/Votline/EasyTranslate v1.0.0/go.mod h1:zopJC37guR8BUnOoDHu2HgM5939oJWRBKVHCbJtqNX4=
 github.com/Votline/Go-audio v1.0.1-0.20260415123656-a38b9c6101c7 h1:i4UuxTOgAKYpsCp/1HbtGJlyDBLTXQyw8GkEaC5NIX8=
 github.com/Votline/Go-audio v1.0.1-0.20260415123656-a38b9c6101c7/go.mod h1:A9VMTlyFkhKwwhj0tOyMelz572OCKfH/IZNdDJutUGA=
+github.com/alphacep/vosk-api/go v0.3.50 h1:2vSN41RCU1WdHEqBrhKtTggfKL6Yu5Dmj+urVszwiuw=
+github.com/alphacep/vosk-api/go v0.3.50/go.mod h1:9X8IJsHnFk/b1xyvjlZifo+ZL5VTAx3LW+JQce/eRcA=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/golang/protobuf v1.5.0/go.mod h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk=

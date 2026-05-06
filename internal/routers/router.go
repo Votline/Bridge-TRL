@@ -26,8 +26,13 @@ func NewServer(log *zap.Logger, workers []wrks.Worker, port string) *Server {
 		port = ":8080"
 	}
 
+	stt, err := wrks.NewSTT(log)
+	if err != nil {
+		log.Fatal("Failed to create STT worker", zap.Error(err))
+	}
+
 	workers = append(workers, wrks.NewTranslator(log))
-	workers = append(workers, wrks.NewSTT(log))
+	workers = append(workers, stt)
 	workers = append(workers, wrks.NewTTS(log))
 	workers = append(workers, wrks.NewInflector(log))
 

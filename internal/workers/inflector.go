@@ -17,8 +17,7 @@ import (
 	"time"
 	"unsafe"
 
-	etrl "github.com/Votline/EasyTranslate"
-
+	rb "btrl/internal/ringbuffer"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
@@ -211,8 +210,8 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("Upgraded connection")
 
-	origBuf := etrl.NewRingBuffer(defaultLength)
-	tranBuf := etrl.NewRingBuffer(defaultLength)
+	origBuf := rb.NewRB[byte](defaultLength)
+	tranBuf := rb.NewRB[byte](defaultLength)
 
 	var wg sync.WaitGroup
 	wg.Go(func() {

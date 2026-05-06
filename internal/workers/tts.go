@@ -18,7 +18,8 @@ import (
 	"time"
 	"unsafe"
 
-	etrl "github.com/Votline/EasyTranslate"
+	rb "btrl/internal/ringbuffer"
+
 	gd "github.com/Votline/Go-audio"
 	gdAu "github.com/Votline/Go-audio/pkg/audio"
 	"github.com/gorilla/websocket"
@@ -212,7 +213,7 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("Upgraded connection")
 
-	comBuf := etrl.NewRingBuffer(defaultLength)
+	comBuf := rb.NewRB[byte](defaultLength)
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
