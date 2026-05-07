@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"sync"
 	"unsafe"
+
+	rb "btrl/internal/ringbuffer"
 )
 
 const (
 	defaultLength = 512
+	defaultRBLen  = defaultLength / 2
 	defAudioLen   = 4096
 	defaultDicts  = "dicts/"
 )
@@ -23,9 +26,23 @@ var bufPool = sync.Pool{
 	},
 }
 
+var ringBufPool = sync.Pool{
+	New: func() any {
+		b := rb.NewRB[byte](defaultRBLen)
+		return b
+	},
+}
+
 var audioBufPool = sync.Pool{
 	New: func() any {
 		b := make([]float32, defAudioLen)
+		return &b
+	},
+}
+
+var int16AudioBufPool = sync.Pool{
+	New: func() any {
+		b := make([]int16, defAudioLen)
 		return &b
 	},
 }

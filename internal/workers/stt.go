@@ -22,7 +22,10 @@ import (
 	"go.uber.org/zap"
 )
 
-const sampleRateSTT = 16000.0
+const (
+	sampleRateSTT = 16000.0
+	trashLen      = len(`"partial" : "`)
+)
 
 // STT struct for implementing worker
 // Contains 'stt' endpoint for speech to text
@@ -58,6 +61,8 @@ func NewSTT(log *zap.Logger) (*STT, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: new vosk recognizer: %w", op, err)
 	}
+
+	rec.SetMaxAlternatives(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -114,7 +119,13 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	t.log.Info("Upgraded connection",
 		zap.String("op", op))
 
+	// audioBuf used for receiving audio data from WS message
 	audioBuf := gd.NewRingBuffer(defAudioLen)
+
+	// gotPCM used for converting audio data to float32 slice
+	gotPCMPtr := audioBufPool.Get().(*[]float32)
+	gotPCM := (*gotPCMPtr)[:0]
+	defer audioBufPool.Put(gotPCMPtr)
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -136,15 +147,33 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 					zap.String("op", op),
 					zap.Int("len", len(msg)))
 
-				pcm := bytesToFloat32(msg)
-				audioBuf.Write(pcm)
+				bytesToFloat32(msg, &gotPCM)
+				audioBuf.Write(gotPCM)
 			}
 		}
 	})
 
-	resBuf := rb.NewRB[byte](defaultLength / 2)
-	res := make([]byte, defaultLength/4)
+	// resBuf used for containing all parsed text from Vosk response
+	resBuf := ringBufPool.Get().(*rb.RingBuffer[byte])
+	defer ringBufPool.Put(resBuf)
 
+	// res used for read parts from resBuf and send to WS
+	resPtr := bufPool.Get().(*[]byte)
+	res := (*resPtr)[:defaultLength]
+	defer bufPool.Put(resPtr)
+
+	// sendPCM used for read audio from audioBuf and send to processAudio
+	sendPCMPtr := audioBufPool.Get().(*[]float32)
+	sendPCM := (*sendPCMPtr)[:defAudioLen]
+	defer audioBufPool.Put(sendPCMPtr)
+
+	// int16Smp used for converting audio data to int16 slice
+	int16SmpPtr := int16AudioBufPool.Get().(*[]int16)
+	int16Smp := (*int16SmpPtr)[:defAudioLen]
+	defer int16AudioBufPool.Put(int16SmpPtr)
+
+	start := 0
+	end := (defaultLength / 4) - trashLen
 	wg.Go(func() {
 		for {
 			select {
@@ -157,11 +186,14 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				temp := make([]float32, audioBuf.Len())
-				cut := audioBuf.Read(temp)
-				pcm := temp[:cut]
+				if len(sendPCM) < audioBuf.Len() {
+					sendPCM = make([]float32, audioBuf.Len())
+				}
 
-				t.processAudio(pcm, resBuf)
+				cut := audioBuf.Read(sendPCM)
+				pcm := sendPCM[:cut]
+
+				t.processAudio(pcm, resBuf, int16Smp, &start, &end)
 			}
 		}
 	})
@@ -174,9 +206,9 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 				return
 			default:
 				cut := resBuf.ReadAll(res, defaultLength/4)
-				res = res[:cut]
+				temp := res[:cut]
 
-				if err := conn.WriteMessage(websocket.TextMessage, res); err != nil {
+				if err := conn.WriteMessage(websocket.TextMessage, temp); err != nil {
 					t.log.Error("Failed to write message",
 						zap.String("op", op),
 						zap.Error(err))
@@ -193,50 +225,32 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 }
 
-func bytesToFloat32(bytes []byte) []float32 {
-	samples := make([]float32, len(bytes)/4)
-	for i := range samples {
-		bits := binary.LittleEndian.Uint32(bytes[i*4:])
-		samples[i] = math.Float32frombits(bits)
+// bytesToFloat32 converts bytes to float32 slice
+func bytesToFloat32(bytes []byte, buf *[]float32) {
+	if len(bytes) == 0 {
+		return
 	}
-	return samples
-}
 
-func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte]) {
-	const op = "workers.STT.processAudio"
-
-	bytesSamples := float32ToVosk(pcm)
-
-	if t.vosk.AcceptWaveform(bytesSamples) != 0 {
-		res, err := parseJSON(t.vosk.Result())
-		if err != nil {
-			t.log.Error("Failed to parse JSON",
-				zap.String("op", op),
-				zap.Error(err))
-			return
-		}
-		resBuf.Write(res)
+	b := *buf
+	neededLen := len(bytes) / 4
+	if cap(b) < neededLen {
+		b = make([]float32, neededLen)
 	} else {
-		partial := t.vosk.PartialResult()
-		t.log.Debug("Partial result",
-			zap.String("op", op),
-			zap.Int("text", len(partial)))
-		if len(partial) > defaultLength/4 {
-			res, err := parseJSON(t.vosk.FinalResult())
-			if err != nil {
-				t.log.Error("Failed to parse JSON",
-					zap.String("op", op),
-					zap.Error(err))
-				return
-			}
-			resBuf.Write(res)
-			t.vosk.Reset()
-		}
+		b = b[:neededLen]
 	}
+
+	for i := range b {
+		bits := binary.LittleEndian.Uint32(bytes[i*4:])
+		b[i] = math.Float32frombits(bits)
+	}
+	*buf = b
 }
 
-func float32ToVosk(pcm []float32) []byte {
-	int16Sampples := make([]int16, len(pcm))
+// float32ToVosk converts float32 slice to bytes
+func float32ToVosk(pcm []float32, int16Samples []int16) {
+	if len(pcm) == 0 {
+		return
+	}
 
 	for i, f := range pcm {
 		if f > 1.0 {
@@ -245,35 +259,78 @@ func float32ToVosk(pcm []float32) []byte {
 			f = -1.0
 		}
 
-		int16Sampples[i] = int16(f * 32767.0)
+		int16Samples[i] = int16(f * 32767.0)
 	}
-
-	bytesSamples := unsafe.Slice((*byte)(unsafe.Pointer(&int16Sampples[0])), len(int16Sampples)*2)
-
-	return bytesSamples
 }
 
-func parseJSON(d string) ([]byte, error) {
-	const op = "workers.parseJSON"
+// processAudio get text from audio
+func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, end *int) {
+	const op = "workers.STT.processAudio"
 
-	json := unsafe.Slice(unsafe.StringData(d), len(d))
+	float32ToVosk(pcm, int16Samples)
+	bytesSamples := unsafe.Slice((*byte)(unsafe.Pointer(&int16Samples[0])), len(pcm)*2)
 
-	res := make([]byte, len(json))
+	curEnd := *end
+	curStart := *start
 
-	sep := []byte(`"text" : "`)
-	start := bytes.Index(json, sep)
+	if t.vosk.AcceptWaveform(bytesSamples) != 0 {
+		res := t.vosk.FinalResult()
+		full := unsafe.Slice(unsafe.StringData(res), len(res))
+		trimJSON(&full, []byte(`"text" : "`))
+
+		if len(full) > 0 {
+			resBuf.Write(full)
+		}
+
+		*start = 0
+		*end = (defaultLength / 4) - trashLen
+	} else {
+		partial := t.vosk.PartialResult()
+		full := unsafe.Slice(unsafe.StringData(partial), len(partial))
+		trimJSON(&full, []byte(`"partial" : "`))
+
+		winSize := (defaultLength / 4) - trashLen
+		if len(full) > curStart {
+			if curEnd > len(full) || curEnd == 0 {
+				curEnd = len(full)
+			}
+
+			if curEnd > curStart {
+				win := full[curStart:curEnd]
+				resBuf.Write(win)
+				curStart += len(win)
+				curEnd += len(win)
+			}
+		}
+		t.log.Info("Partial result",
+			zap.String("op", op),
+			zap.Int("len", len(partial)),
+			zap.Int("curStart", curStart),
+			zap.Int("curEnd", curEnd),
+			zap.Int("winSize", winSize))
+	}
+
+	*end = curEnd
+	*start = curStart
+}
+
+// trimJSON remove  pattern from the VOSK resutl
+func trimJSON(d *[]byte, pattern []byte) {
+	json := *d
+
+	start := bytes.Index(json, pattern)
 	if start == -1 {
-		return nil, fmt.Errorf("%s: failed to find start of text", op)
+		return
 	}
-	start += len(sep)
+	start += len(pattern)
 
-	end := bytes.Index(json[start:], []byte(`"`))
-	if end == -1 {
-		return nil, fmt.Errorf("%s: failed to find end of text", op)
+	relativeEnd := bytes.IndexByte(json[start:], '"')
+	if relativeEnd == -1 {
+		*d = json[start:]
+		return
 	}
-	end += start
 
-	copy(res, json[start:end])
+	actualEnd := start + relativeEnd
 
-	return res, nil
+	*d = json[start:actualEnd]
 }
