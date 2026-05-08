@@ -173,6 +173,8 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	defer int16AudioBufPool.Put(int16SmpPtr)
 
 	start := 0
+	estEnd := 0
+	skipCnt := 0
 	end := (defaultLength / 4) - trashLen
 	wg.Go(func() {
 		for {
@@ -193,7 +195,7 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 				cut := audioBuf.Read(sendPCM)
 				pcm := sendPCM[:cut]
 
-				t.processAudio(pcm, resBuf, int16Smp, &start, &end)
+				t.processAudio(pcm, resBuf, int16Smp, &start, &estEnd, &end, &skipCnt)
 			}
 		}
 	})
@@ -205,7 +207,7 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 				t.log.Info("Context done", zap.String("op", op))
 				return
 			default:
-				cut := resBuf.ReadAll(res, defaultLength/4)
+				cut := resBuf.Read(res)
 				temp := res[:cut]
 
 				if err := conn.WriteMessage(websocket.TextMessage, temp); err != nil {
@@ -223,6 +225,117 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	})
 
 	wg.Wait()
+}
+
+func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, estEnd, end, skipCnt *int) {
+	const op = "workers.STT.processAudio"
+
+	if len(pcm) == 0 {
+		t.log.Warn("Empty pcm float32 data",
+			zap.String("op", op))
+		return
+	}
+
+	float32ToVosk(pcm, int16Samples)
+	if len(int16Samples) == 0 {
+		t.log.Warn("Empty pcm int16 data",
+			zap.String("op", op))
+		return
+	}
+	bytesSamples := unsafe.Slice((*byte)(unsafe.Pointer(&int16Samples[0])), len(pcm)*2)
+
+	final := t.vosk.AcceptWaveform(bytesSamples)
+
+	partial := t.vosk.PartialResult()
+	trimmed := unsafe.Slice(unsafe.StringData(partial), len(partial))
+	trimJSON(&trimmed, []byte(`"partial" : "`))
+
+	curStart := *start
+	curEnd := *end
+	curEstEnd := *estEnd
+	curSkip := *skipCnt
+
+	if final == 1 {
+		resBuf.Write(trimmed[curStart:])
+
+		t.log.Info("Write FINAL data",
+			zap.String("op", op),
+			zap.Int("start", curStart),
+			zap.Int("end", curEnd))
+
+		*start = 0
+		*end = (defaultLength / 4) - trashLen
+		*skipCnt = 0
+
+		t.vosk.Reset()
+		return
+	}
+
+	if len(trimmed) < curEnd {
+		t.log.Warn("Trimmed text is too short",
+			zap.String("op", op),
+			zap.Int("len", len(trimmed)),
+			zap.Int("curEnd", curEnd))
+		return
+	}
+
+	if curSkip >= 10 {
+		curSkip = 0
+
+		localEnd := bytes.IndexByte(trimmed[curEstEnd:], ' ')
+		if localEnd == -1 {
+			localEnd = curEstEnd
+		} else {
+			localEnd += curEstEnd
+		}
+		curEnd = localEnd
+
+		resBuf.Write(trimmed[curStart:curEnd])
+
+		t.log.Info("Write data",
+			zap.String("op", op),
+			zap.Int("start", curStart),
+			zap.Int("end", curEnd))
+
+		curStart = curEnd
+		curEstEnd = 0
+
+		curEnd += (defaultLength / 4) - trashLen
+
+	} else if curSkip == 0 {
+		curSkip++
+		curEstEnd = curEnd
+	} else {
+		curSkip++
+	}
+
+	*start = curStart
+	*end = curEnd
+	*estEnd = curEstEnd
+	*skipCnt = curSkip
+
+	t.log.Info("Skip count",
+		zap.String("op", op),
+		zap.Int("skipCnt", curSkip))
+}
+
+func trimJSON(d *[]byte, pattern []byte) {
+	json := *d
+
+	start := bytes.Index(json, pattern)
+	if start == -1 {
+		return
+	}
+	start += len(pattern)
+
+	end := bytes.LastIndexByte(json[start:], '"')
+	if end == -1 {
+		*d = json[start:]
+		return
+	}
+	end += start
+
+	*d = json[start:end]
 }
 
 // bytesToFloat32 converts bytes to float32 slice
@@ -261,76 +374,4 @@ func float32ToVosk(pcm []float32, int16Samples []int16) {
 
 		int16Samples[i] = int16(f * 32767.0)
 	}
-}
-
-// processAudio get text from audio
-func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, end *int) {
-	const op = "workers.STT.processAudio"
-
-	float32ToVosk(pcm, int16Samples)
-	bytesSamples := unsafe.Slice((*byte)(unsafe.Pointer(&int16Samples[0])), len(pcm)*2)
-
-	curEnd := *end
-	curStart := *start
-
-	if t.vosk.AcceptWaveform(bytesSamples) != 0 {
-		res := t.vosk.FinalResult()
-		full := unsafe.Slice(unsafe.StringData(res), len(res))
-		trimJSON(&full, []byte(`"text" : "`))
-
-		if len(full) > 0 {
-			resBuf.Write(full)
-		}
-
-		*start = 0
-		*end = (defaultLength / 4) - trashLen
-	} else {
-		partial := t.vosk.PartialResult()
-		full := unsafe.Slice(unsafe.StringData(partial), len(partial))
-		trimJSON(&full, []byte(`"partial" : "`))
-
-		winSize := (defaultLength / 4) - trashLen
-		if len(full) > curStart {
-			if curEnd > len(full) || curEnd == 0 {
-				curEnd = len(full)
-			}
-
-			if curEnd > curStart {
-				win := full[curStart:curEnd]
-				resBuf.Write(win)
-				curStart += len(win)
-				curEnd += len(win)
-			}
-		}
-		t.log.Info("Partial result",
-			zap.String("op", op),
-			zap.Int("len", len(partial)),
-			zap.Int("curStart", curStart),
-			zap.Int("curEnd", curEnd),
-			zap.Int("winSize", winSize))
-	}
-
-	*end = curEnd
-	*start = curStart
-}
-
-// trimJSON remove  pattern from the VOSK resutl
-func trimJSON(d *[]byte, pattern []byte) {
-	json := *d
-
-	start := bytes.Index(json, pattern)
-	if start == -1 {
-		return
-	}
-	start += len(pattern)
-
-	relativeEnd := bytes.IndexByte(json[start:], '"')
-	if relativeEnd == -1 {
-		*d = json[start:]
-		return
-	}
-
-	actualEnd := start + relativeEnd
-
-	*d = json[start:actualEnd]
 }

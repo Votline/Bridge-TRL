@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultLength = 512
-	defaultRBLen  = defaultLength / 2
+	defaultRBLen  = defaultLength
 	defAudioLen   = 4096
 	defaultDicts  = "dicts/"
 )
