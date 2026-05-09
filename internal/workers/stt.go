@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -52,23 +53,11 @@ func NewSTT(log *zap.Logger) (*STT, error) {
 		},
 	}
 
-	model, err := vosk.NewModel("assets/vosk-model-small-ru-0.22")
-	if err != nil {
-		return nil, fmt.Errorf("%s: new vosk model: %w", op, err)
-	}
-
-	rec, err := vosk.NewRecognizer(model, sampleRateSTT)
-	if err != nil {
-		return nil, fmt.Errorf("%s: new vosk recognizer: %w", op, err)
-	}
-
-	rec.SetMaxAlternatives(0)
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &STT{
 		Name:   "STT",
-		vosk:   rec,
+		vosk:   nil,
 		log:    log,
 		upg:    upg,
 		ctx:    ctx,
@@ -85,6 +74,7 @@ func (t *STT) GetName() string {
 // Register the worker endpoints on the http.ServeMux
 func (t *STT) Register(m *http.ServeMux) {
 	m.HandleFunc("/stt", t.STT)
+	m.HandleFunc("/stt/setOptions", t.setOptions)
 }
 
 // Close cancels the context
@@ -96,6 +86,68 @@ func (t *STT) Close(ctx context.Context) {
 	}
 }
 
+// setOptions create model and recognizer
+// ModelPath is path to model
+func (t *STT) setOptions(w http.ResponseWriter, r *http.Request) {
+	const op = "workers.STT.setOptions"
+
+	var req struct {
+		ModelPath string `json:"model_Path"`
+	}
+
+	t.log.Info("Set options",
+		zap.String("op", op))
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		t.log.Error("Failed to decode request",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to decode request",
+			http.StatusInternalServerError)
+		return
+	}
+
+	if err := t.initModel(req.ModelPath); err != nil {
+		t.log.Error("Failed to init model",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to init model",
+			http.StatusInternalServerError)
+		return
+	}
+
+	t.log.Info("Set model path",
+		zap.String("op", op),
+		zap.String("modelPath", req.ModelPath))
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// initModel creates recognizer for speech to text
+func (t *STT) initModel(modelPath string) error {
+	const op = "workers.STT.initModel"
+
+	if modelPath == "" {
+		modelPath = "assets/vosk-Model-small-ru-0.22"
+	}
+
+	model, err := vosk.NewModel(modelPath)
+	if err != nil {
+		return fmt.Errorf("%s: new vosk model: %w", op, err)
+	}
+
+	rec, err := vosk.NewRecognizer(model, sampleRateSTT)
+	if err != nil {
+		return fmt.Errorf("%s: new vosk recognizer: %w", op, err)
+	}
+
+	rec.SetMaxAlternatives(0)
+
+	t.vosk = rec
+
+	return nil
+}
+
 // STT speech to text
 // Use WebSockets for streaming
 // Returned text is in the source language
@@ -104,6 +156,17 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("STT request",
 		zap.String("op", op))
+
+	if t.vosk == nil {
+		if err := t.initModel(""); err != nil {
+			t.log.Error("Failed to init model",
+				zap.String("op", op),
+				zap.Error(err))
+			http.Error(w, "Failed to init model",
+				http.StatusInternalServerError)
+			return
+		}
+	}
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {

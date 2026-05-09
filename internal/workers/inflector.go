@@ -177,6 +177,7 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t.client = client
+	t.call = req.Call
 
 	t.log.Info("Set options",
 		zap.String("op", op),
@@ -423,7 +424,7 @@ func isSpace(b byte) bool {
 // sendHTTP sends text for inflecting to the server
 // return inflicted text and error
 func (t *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string) ([]byte, error) {
-	const op = "inflector.sendAI"
+	const op = "inflector.callAPI"
 
 	t.log.Info("Send request",
 		zap.String("op", op),

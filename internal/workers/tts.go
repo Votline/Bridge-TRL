@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,8 +19,6 @@ import (
 
 	rb "btrl/internal/ringbuffer"
 
-	gd "github.com/Votline/Go-audio"
-	gdAu "github.com/Votline/Go-audio/pkg/audio"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
@@ -66,9 +63,6 @@ type TTS struct {
 	// Default is 2 seconds
 	readTimeout time.Duration
 
-	// acl is AudioClient for playing audio
-	acl *gdAu.AudioClient
-
 	// client is a client for send requests
 	client *http.Client
 
@@ -88,6 +82,7 @@ func NewTTS(log *zap.Logger) *TTS {
 	}
 	return &TTS{
 		Name:   "TTS",
+		call:   "",
 		log:    log,
 		upg:    upg,
 		ctx:    ctx,
@@ -127,24 +122,6 @@ func (t *TTS) setOptions(w http.ResponseWriter, r *http.Request) {
 		ModelName   string `json:"model_name"`
 		ReadTimeout int    `json:"read_timeout"`
 	}
-
-	acl, err := gd.InitAudioClient(
-		0, 0, 0, 0,
-		channels, 0, sampleRate, duration,
-		false, nil,
-	)
-	if err != nil {
-		t.log.Error("Failed to init audio client",
-			zap.String("op", op),
-			zap.Error(err))
-		http.Error(w, "Failed to init audio client",
-			http.StatusInternalServerError)
-		return
-	}
-
-	t.log.Info("Init audio client")
-
-	t.acl = acl
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		t.log.Error("Failed to decode request",
@@ -189,6 +166,26 @@ func (t *TTS) setOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// defaultOptions set default options
+// 'Artemiy' voice is used by default
+// Write to /dev/stdout is used by default
+func (t *TTS) defaultOptions() {
+	const op = "tts.defaultOptions"
+
+	if t.call == "" {
+		t.call = "./assets/RHVoice -p artemiy -o /dev/stdout"
+	}
+
+	t.mode = ttsModeScript
+
+	if t.readTimeout == 0 {
+		t.readTimeout = 2
+	}
+
+	t.log.Info("Set default options",
+		zap.String("op", op))
+}
+
 // TTS makes audio from text
 // Use WebSockets for streaming
 // Returned bytes are audio data
@@ -197,6 +194,10 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("TTS request",
 		zap.String("op", op))
+
+	if t.call == "" {
+		t.defaultOptions()
+	}
 
 	t.ctx = r.Context()
 
@@ -249,10 +250,7 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 		audioBufPool.Put(floatBufPtr)
 	}()
 
-	pr, pw := io.Pipe()
-
 	wg.Go(func() {
-		defer pw.Close()
 		for {
 			select {
 			case <-t.ctx.Done():
@@ -291,61 +289,25 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
+				if len(bytesPCM) == 0 {
+					t.log.Warn("Empty PCM data",
+						zap.String("op", op))
+					return
+				}
+
 				t.log.Info("Got data",
 					zap.String("op", op),
 					zap.Int("res length", len(bytesPCM)))
 
-				idx := bytes.Index(bytesPCM, []byte("data"))
-				if idx == -1 {
-					t.log.Error("Not WAV data",
-						zap.String("op", op))
+				if err := conn.WriteMessage(websocket.BinaryMessage, bytesPCM); err != nil {
+					t.log.Error("Failed to write message",
+						zap.String("op", op),
+						zap.Error(err))
 					return
-				}
-
-				dataStart := idx + 8 // 4 - len data, + 4 - chunk size
-				if dataStart >= len(bytesPCM) {
-					t.log.Error("Invalid audio data",
-						zap.String("op", op))
-					return
-				}
-
-				samplePerPacket := ((sampleRate * duration) / 1000) * channels // formula for Go-audio
-				bytesPerPacket := samplePerPacket * 2                          // cuz original - int16
-
-				for i := dataStart; i < len(bytesPCM); i += bytesPerPacket {
-					end := i + bytesPerPacket
-					end = min(end, len(bytesPCM))
-
-					curChunk := bytesPCM[i:end]
-					numSamples := len(curChunk) / 2
-
-					// floatBuf := (*floatBufPtr)[:numSamples]
-					floatBuf := make([]float32, numSamples)
-					for j := range numSamples {
-						s := int16(binary.LittleEndian.Uint16(curChunk[j*2 : (j+1)*2]))
-						floatBuf[j] = float32(s) / 32768.0
-					}
-
-					size := uint32(len(floatBuf) * 4)
-					if err := binary.Write(pw, binary.LittleEndian, size); err != nil {
-						t.log.Error("Failed to write size",
-							zap.String("op", op),
-							zap.Error(err))
-						return
-					}
-
-					if err := binary.Write(pw, binary.LittleEndian, floatBuf); err != nil {
-						t.log.Error("Failed to write data",
-							zap.String("op", op),
-							zap.Error(err))
-						return
-					}
 				}
 			}
 		}
 	})
-
-	t.acl.Play(pr)
 
 	wg.Wait()
 }
