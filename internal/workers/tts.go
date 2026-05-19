@@ -192,12 +192,16 @@ func (t *TTS) defaultOptions() {
 func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 	const op = "tts.TTS"
 
-	t.log.Info("TTS request",
-		zap.String("op", op))
-
 	if t.call == "" {
 		t.defaultOptions()
 	}
+
+	t.log.Info("TTS request",
+		zap.String("op", op),
+		zap.String("call", t.call),
+		zap.String("voiceID", t.voiceID),
+		zap.String("modelName", t.modelName),
+		zap.String("readTimeout", fmt.Sprintf("%d", t.readTimeout)))
 
 	t.ctx = r.Context()
 

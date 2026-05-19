@@ -128,7 +128,7 @@ func (t *STT) initModel(modelPath string) error {
 	const op = "workers.STT.initModel"
 
 	if modelPath == "" {
-		modelPath = "assets/vosk-Model-small-ru-0.22"
+		modelPath = "assets/vosk-model-small-ru-0.22"
 	}
 
 	model, err := vosk.NewModel(modelPath)
@@ -154,9 +154,6 @@ func (t *STT) initModel(modelPath string) error {
 func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	const op = "workers.STT"
 
-	t.log.Info("STT request",
-		zap.String("op", op))
-
 	if t.vosk == nil {
 		if err := t.initModel(""); err != nil {
 			t.log.Error("Failed to init model",
@@ -167,6 +164,9 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	t.log.Info("STT request",
+		zap.String("op", op))
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {

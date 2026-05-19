@@ -107,8 +107,13 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 
 	lock := true
 
+	if t.prefLang == "" {
+		t.prefLang = "ru"
+	}
+
 	t.log.Info("Translate request",
-		zap.String("op", op))
+		zap.String("op", op),
+		zap.String("prefLang", t.prefLang))
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {

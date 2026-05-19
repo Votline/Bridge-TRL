@@ -188,13 +188,32 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (t *Inflector) initTranslator() {
+	const op = "inflector.initTranslator"
+
+	t.call = ""
+}
+
 // Inflector makes audio from text
 // Use WebSockets for streaming
 // Returned bytes are audio data
 func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	const op = "inflector.Inflector"
 
-	t.log.Info("Inflector request")
+	if t.call == "" {
+		t.call = "http://localhost:11434/api/generate"
+		t.model = "gemma2:2b_Q4_K_M"
+		t.readTimeout = 60 * time.Second
+		t.mode = inflectorModeAPI
+		t.client = nil
+	}
+
+	t.log.Info("Inflector request",
+		zap.String("op", op),
+		zap.String("call", t.call),
+		zap.String("model", t.model),
+		zap.String("readTimeout", fmt.Sprintf("%d", t.readTimeout)),
+		zap.String("mode", fmt.Sprintf("%d", t.mode)))
 
 	t.ctx = r.Context()
 
@@ -209,7 +228,7 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	t.log.Info("Upgraded connection")
+	t.log.Info("Upgraded connection", zap.String("op", op))
 
 	origBuf := rb.NewRB[byte](defaultLength)
 	tranBuf := rb.NewRB[byte](defaultLength)
@@ -219,7 +238,7 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
 			case <-t.ctx.Done():
-				t.log.Info("Context done")
+				t.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				_, msg, err := conn.ReadMessage()
@@ -272,7 +291,7 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
 			case <-t.ctx.Done():
-				t.log.Info("Context done")
+				t.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				if tranBuf.Len() == 0 {
