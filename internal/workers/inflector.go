@@ -200,6 +200,8 @@ func (t *Inflector) initTranslator() {
 func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	const op = "inflector.Inflector"
 
+	defer t.log.Debug("Leave", zap.String("op", op))
+
 	if t.call == "" {
 		t.call = "http://localhost:11434/api/generate"
 		t.model = "gemma2:2b_Q4_K_M"

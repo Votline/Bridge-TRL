@@ -173,7 +173,7 @@ func (t *TTS) defaultOptions() {
 	const op = "tts.defaultOptions"
 
 	if t.call == "" {
-		t.call = "./assets/RHVoice -p artemiy -o /dev/stdout"
+		t.call = "./assets/RHVoice -p artemiy -R 16000 -o /dev/stdout"
 	}
 
 	t.mode = ttsModeScript
@@ -191,6 +191,8 @@ func (t *TTS) defaultOptions() {
 // Returned bytes are audio data
 func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 	const op = "tts.TTS"
+
+	defer t.log.Debug("Leave", zap.String("op", op))
 
 	if t.call == "" {
 		t.defaultOptions()

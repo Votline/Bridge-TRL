@@ -154,6 +154,8 @@ func (t *STT) initModel(modelPath string) error {
 func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	const op = "workers.STT"
 
+	defer t.log.Debug("Leave", zap.String("op", op))
+
 	if t.vosk == nil {
 		if err := t.initModel(""); err != nil {
 			t.log.Error("Failed to init model",
@@ -167,6 +169,8 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 
 	t.log.Info("STT request",
 		zap.String("op", op))
+
+	t.vosk.Reset()
 
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {
@@ -204,6 +208,10 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 						zap.String("op", op),
 						zap.Error(err))
 					return
+				}
+
+				if len(msg) == 0 {
+					continue
 				}
 
 				t.log.Info("Got PCM",
@@ -290,6 +298,12 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 }
 
+// processAudio send audio data to Vosk and send text to buffer
+// It collect partial result from Vosk and send sliding window to buffer
+// pcm - audio data, resBuf - buffer for result
+// cursors: start - start of sliding window, estEnd - estimated end of sliding window,
+// end - end of sliding window, skipCnt - counter for skipping audio data
+// skipCnt used for waiting vosk to finish processing last word in current window
 func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, estEnd, end, skipCnt *int) {
 	const op = "workers.STT.processAudio"
 
@@ -313,6 +327,10 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 	trimmed := unsafe.Slice(unsafe.StringData(partial), len(partial))
 	trimJSON(&trimmed, []byte(`"partial" : "`))
 
+	if len(trimmed) == 0 {
+		return
+	}
+
 	curStart := *start
 	curEnd := *end
 	curEstEnd := *estEnd
@@ -331,6 +349,19 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 		*skipCnt = 0
 
 		t.vosk.Reset()
+		return
+	}
+
+	if len(trimmed) < curStart {
+		t.log.Info("Vosk partial shrunk, resetting state",
+			zap.String("op", op),
+			zap.Int("current length", len(trimmed)),
+			zap.Int("curStart", curStart))
+
+		*start = 0
+		*end = (defaultLength / 4) - trashLen
+		*skipCnt = 0
+
 		return
 	}
 
@@ -382,6 +413,8 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 		zap.Int("skipCnt", curSkip))
 }
 
+// trimJSON removes the pattern from the JSON
+// Used for removing "partial" : "" from the JSON
 func trimJSON(d *[]byte, pattern []byte) {
 	json := *d
 

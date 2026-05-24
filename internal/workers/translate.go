@@ -105,6 +105,8 @@ func (t *Translator) setPref(w http.ResponseWriter, r *http.Request) {
 func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 	const op = "translator.translate"
 
+	defer t.log.Debug("Leave", zap.String("op", op))
+
 	lock := true
 
 	if t.prefLang == "" {
