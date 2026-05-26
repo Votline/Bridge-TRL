@@ -15,6 +15,7 @@ require (
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/kljensen/snowball v0.10.0 // indirect
+	github.com/otiai10/gosseract v2.2.1+incompatible // indirect
 	github.com/pemistahl/lingua-go v1.4.0 // indirect
 	github.com/shopspring/decimal v1.3.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect

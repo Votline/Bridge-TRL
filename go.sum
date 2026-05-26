@@ -18,6 +18,8 @@ github.com/klauspost/compress v1.18.5 h1:/h1gH5Ce+VWNLSWqPzOVn6XBO+vJbCNGvjoaGBF
 github.com/klauspost/compress v1.18.5/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/kljensen/snowball v0.10.0 h1:8qgaBLraSuUVHtGH5tJ+VdGpqgfcaE2WkswL/C3nVhY=
 github.com/kljensen/snowball v0.10.0/go.mod h1:bJcxtur1W5Qw4fVj9tk5W88zyRcGQQjqahFErdcDTHk=
+github.com/otiai10/gosseract v2.2.1+incompatible h1:Ry5ltVdpdp4LAa2bMjsSJH34XHVOV7XMi41HtzL8X2I=
+github.com/otiai10/gosseract v2.2.1+incompatible/go.mod h1:XrzWItCzCpFRZ35n3YtVTgq5bLAhFIkascoRo8G32QE=
 github.com/pemistahl/lingua-go v1.4.0 h1:ifYhthrlW7iO4icdubwlduYnmwU37V1sbNrwhKBR4rM=
 github.com/pemistahl/lingua-go v1.4.0/go.mod h1:ECuM1Hp/3hvyh7k8aWSqNCPlTxLemFZsRjocUf3KgME=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
