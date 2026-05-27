@@ -1,5 +1,5 @@
-// Package workers contains worker implementations for translate
-// Translate text from one language to another
+// Package workers translator.go contains worker implementations for translator
+// Translator text from one language to another
 // Returned text is in the target language
 package workers
 
@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
 	"unsafe"
 
 	etrl "github.com/Votline/EasyTranslate"
@@ -28,13 +27,10 @@ type Translator struct {
 	log      *zap.Logger
 	upg      websocket.Upgrader
 	trl      *etrl.EasyTranslate
-	ctx      context.Context
-	cancel   context.CancelFunc
 }
 
 // NewTranslator creates a new Translate worker
 func NewTranslator(log *zap.Logger) *Translator {
-	ctx, cancel := context.WithCancel(context.Background())
 	upg := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -44,12 +40,10 @@ func NewTranslator(log *zap.Logger) *Translator {
 	translator := etrl.NewEasyTranslate(defaultDicts)
 
 	return &Translator{
-		Name:   "Translator",
-		log:    log,
-		upg:    upg,
-		trl:    translator,
-		ctx:    ctx,
-		cancel: cancel,
+		Name: "Translator",
+		log:  log,
+		upg:  upg,
+		trl:  translator,
 	}
 }
 
@@ -63,12 +57,6 @@ func (t *Translator) GetName() string {
 func (t *Translator) Register(m *http.ServeMux) {
 	m.HandleFunc("/translate", t.Translate)
 	m.HandleFunc("/translate/setPrefferedLanguage", t.setPref)
-}
-
-// Close cancels the context
-// Cancel context is used for shutdown WS connections
-func (t *Translator) Close(ctx context.Context) {
-	t.cancel()
 }
 
 // setPref sets preferred language
@@ -126,6 +114,9 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	t.log.Info("Upgraded connection",
 		zap.String("op", op))
 
@@ -158,9 +149,9 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 
 	inCom.Write(msg)
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		if err := t.trl.StartTranslate(t.ctx, inCom, dict, defaultLength, func(data []byte) {
+	go func() {
+		defer cancel()
+		if err := t.trl.StartTranslate(ctx, inCom, dict, defaultLength, func(data []byte) {
 			t.log.Debug("Received translated text",
 				zap.String("op", op),
 				zap.String("text", unsafe.String(unsafe.SliceData(data), len(data))))
@@ -169,56 +160,63 @@ func (t *Translator) Translate(w http.ResponseWriter, r *http.Request) {
 			t.log.Error("Failed to start translate",
 				zap.String("op", op),
 				zap.Error(err))
-			t.cancel()
+			return
 		}
-	})
+	}()
 
 	data := make([]byte, defaultLength)
-	for {
-		select {
-		case <-t.ctx.Done():
-			t.log.Info("Context done",
-				zap.String("op", op))
-			inCom.Close()
-			return
-		default:
-			if !lock {
-				_, msg, err = conn.ReadMessage()
+	go func() {
+		for {
+			defer cancel()
+			select {
+			case <-ctx.Done():
+				t.log.Info("Context done",
+					zap.String("op", op))
+				inCom.Close()
+				return
+			default:
+				if !lock {
+					_, msg, err = conn.ReadMessage()
+					if err != nil {
+						t.log.Error("Failed to read message",
+							zap.String("op", op),
+							zap.Error(err))
+						return
+					}
+
+					t.log.Debug("Received message",
+						zap.String("op", op),
+						zap.String("message", unsafe.String(unsafe.SliceData(msg), len(msg))))
+
+					inCom.Write(msg)
+				}
+				cut := outCom.Read(data)
+				if cut <= 0 {
+					t.log.Error("Failed to read translated text",
+						zap.String("op", op))
+					return
+				}
+
+				err = conn.WriteMessage(websocket.TextMessage, data[:cut])
 				if err != nil {
-					t.log.Error("Failed to read message",
+					t.log.Error("Failed to write message",
 						zap.String("op", op),
 						zap.Error(err))
 					return
 				}
 
-				t.log.Debug("Received message",
+				t.log.Debug("Sent message",
 					zap.String("op", op),
-					zap.String("message", unsafe.String(unsafe.SliceData(msg), len(msg))))
+					zap.String("message", unsafe.String(unsafe.SliceData(data[:cut]), len(data[:cut]))))
 
-				inCom.Write(msg)
+				lock = false
 			}
-			cut := outCom.Read(data)
-			if cut <= 0 {
-				t.log.Error("Failed to read translated text",
-					zap.String("op", op))
-				return
-			}
-
-			err = conn.WriteMessage(websocket.TextMessage, data[:cut])
-			if err != nil {
-				t.log.Error("Failed to write message",
-					zap.String("op", op),
-					zap.Error(err))
-				return
-			}
-
-			t.log.Debug("Sent message",
-				zap.String("op", op),
-				zap.String("message", unsafe.String(unsafe.SliceData(data[:cut]), len(data[:cut]))))
-
-			lock = false
 		}
-	}
+	}()
+
+	<-ctx.Done()
+	t.log.Info("Context done", zap.String("op", op))
+	inCom.Close()
 }
 
 // prepareTranslator prepares the easyTranslator package for translating

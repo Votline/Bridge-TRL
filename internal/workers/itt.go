@@ -1,3 +1,6 @@
+// Package workers itt.go contains worker implementations for image to text
+// Image to text
+// Returned text is in the source language
 package workers
 
 import (
@@ -54,9 +57,10 @@ func (i *ITT) Register(m *http.ServeMux) {
 	m.HandleFunc("/itt", i.ITT)
 }
 
-func (i *ITT) Close(ctx context.Context) {
-}
-
+// ITT makes image to text
+// Use WebSockets for streaming
+// Use gosseract for image to text
+// Returned text is in the source language
 func (i *ITT) ITT(w http.ResponseWriter, r *http.Request) {
 	const op = "workeri.ITT"
 
@@ -126,9 +130,6 @@ func (i *ITT) ITT(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	select {
-	case <-ctx.Done():
-		i.log.Info("Context done", zap.String("op", op))
-		return
-	}
+	<-ctx.Done()
+	i.log.Info("Context done", zap.String("op", op))
 }

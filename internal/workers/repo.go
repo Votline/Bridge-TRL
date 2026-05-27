@@ -3,12 +3,17 @@ package workers
 
 import (
 	"bytes"
-	"context"
+	"fmt"
+	"io"
 	"net/http"
+	"os/exec"
+	"strings"
 	"sync"
 	"unsafe"
 
 	rb "btrl/internal/ringbuffer"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -52,7 +57,6 @@ var int16AudioBufPool = sync.Pool{
 type Worker interface {
 	GetName() string
 	Register(m *http.ServeMux)
-	Close(ctx context.Context)
 }
 
 func findAPIPrefix(d string) bool {
@@ -66,4 +70,51 @@ func findAPIPrefix(d string) bool {
 		}
 	}
 	return true
+}
+
+func callScript(scriptCall string, jsonData []byte, log *zap.Logger) ([]byte, error) {
+	const op = "workers.repo.callScript"
+
+	log.Info("Call script",
+		zap.String("op", op),
+		zap.String("script call", scriptCall))
+
+	parts := strings.Split(scriptCall, " ")
+
+	cmd := exec.Command(parts[0], parts[1:]...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to get stdin pipe: %w", op, err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to get stdout pipe: %w", op, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("%s: failed to start script: %w", op, err)
+	}
+
+	if _, err := stdin.Write(jsonData); err != nil {
+		return nil, fmt.Errorf("%s: failed to write to stdin: %w", op, err)
+	}
+
+	if err := stdin.Close(); err != nil {
+		return nil, fmt.Errorf("%s: failed to close stdin: %w", op, err)
+	}
+
+	resBytes, err := io.ReadAll(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to read stdout: %w", op, err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("%s: failed to wait for script: %w", op, err)
+	}
+
+	trimSpaceBytes(&resBytes)
+
+	return resBytes, nil
 }

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -37,10 +36,8 @@ type STT struct {
 	// vosk is a recognizer for speech to text
 	vosk *vosk.VoskRecognizer
 
-	log    *zap.Logger
-	upg    websocket.Upgrader
-	ctx    context.Context
-	cancel context.CancelFunc
+	log *zap.Logger
+	upg websocket.Upgrader
 }
 
 // NewSTT creates a new STT worker
@@ -53,53 +50,47 @@ func NewSTT(log *zap.Logger) (*STT, error) {
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	return &STT{
-		Name:   "STT",
-		vosk:   nil,
-		log:    log,
-		upg:    upg,
-		ctx:    ctx,
-		cancel: cancel,
+		Name: "STT",
+		vosk: nil,
+		log:  log,
+		upg:  upg,
 	}, nil
 }
 
 // GetName returns the name of the worker
 // Used for logging
-func (t *STT) GetName() string {
-	return t.Name
+func (s *STT) GetName() string {
+	return s.Name
 }
 
 // Register the worker endpoints on the http.ServeMux
-func (t *STT) Register(m *http.ServeMux) {
-	m.HandleFunc("/stt", t.STT)
-	m.HandleFunc("/stt/setOptions", t.setOptions)
+func (s *STT) Register(m *http.ServeMux) {
+	m.HandleFunc("/stt", s.STT)
+	m.HandleFunc("/stt/setOptions", s.setOptions)
 }
 
-// Close cancels the context
-// Cancel context is used for shutdown WS connections
-func (t *STT) Close(ctx context.Context) {
-	t.cancel()
-	if t.vosk != nil {
-		t.vosk.Free()
+// Close frees the model
+func (s *STT) Close(ctx context.Context) {
+	if s.vosk != nil {
+		s.vosk.Free()
 	}
 }
 
 // setOptions create model and recognizer
 // ModelPath is path to model
-func (t *STT) setOptions(w http.ResponseWriter, r *http.Request) {
+func (s *STT) setOptions(w http.ResponseWriter, r *http.Request) {
 	const op = "workers.STT.setOptions"
 
 	var req struct {
 		ModelPath string `json:"model_Path"`
 	}
 
-	t.log.Info("Set options",
+	s.log.Info("Set options",
 		zap.String("op", op))
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		t.log.Error("Failed to decode request",
+		s.log.Error("Failed to decode request",
 			zap.String("op", op),
 			zap.Error(err))
 		http.Error(w, "Failed to decode request",
@@ -107,8 +98,8 @@ func (t *STT) setOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := t.initModel(req.ModelPath); err != nil {
-		t.log.Error("Failed to init model",
+	if err := s.initModel(req.ModelPath); err != nil {
+		s.log.Error("Failed to init model",
 			zap.String("op", op),
 			zap.Error(err))
 		http.Error(w, "Failed to init model",
@@ -116,7 +107,7 @@ func (t *STT) setOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t.log.Info("Set model path",
+	s.log.Info("Set model path",
 		zap.String("op", op),
 		zap.String("modelPath", req.ModelPath))
 
@@ -124,7 +115,7 @@ func (t *STT) setOptions(w http.ResponseWriter, r *http.Request) {
 }
 
 // initModel creates recognizer for speech to text
-func (t *STT) initModel(modelPath string) error {
+func (s *STT) initModel(modelPath string) error {
 	const op = "workers.STT.initModel"
 
 	if modelPath == "" {
@@ -143,7 +134,7 @@ func (t *STT) initModel(modelPath string) error {
 
 	rec.SetMaxAlternatives(0)
 
-	t.vosk = rec
+	s.vosk = rec
 
 	return nil
 }
@@ -151,14 +142,14 @@ func (t *STT) initModel(modelPath string) error {
 // STT speech to text
 // Use WebSockets for streaming
 // Returned text is in the source language
-func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
+func (s *STT) STT(w http.ResponseWriter, r *http.Request) {
 	const op = "workers.STT"
 
-	defer t.log.Debug("Leave", zap.String("op", op))
+	defer s.log.Debug("Leave", zap.String("op", op))
 
-	if t.vosk == nil {
-		if err := t.initModel(""); err != nil {
-			t.log.Error("Failed to init model",
+	if s.vosk == nil {
+		if err := s.initModel(""); err != nil {
+			s.log.Error("Failed to init model",
 				zap.String("op", op),
 				zap.Error(err))
 			http.Error(w, "Failed to init model",
@@ -167,14 +158,14 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	t.log.Info("STT request",
+	s.log.Info("STT request",
 		zap.String("op", op))
 
-	t.vosk.Reset()
+	s.vosk.Reset()
 
-	conn, err := t.upg.Upgrade(w, r, nil)
+	conn, err := s.upg.Upgrade(w, r, nil)
 	if err != nil {
-		t.log.Error("Failed to upgrade connection",
+		s.log.Error("Failed to upgrade connection",
 			zap.String("op", op),
 			zap.Error(err))
 		http.Error(w, "Failed to upgrade connection",
@@ -183,7 +174,10 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	t.log.Info("Upgraded connection",
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	s.log.Info("Upgraded connection",
 		zap.String("op", op))
 
 	// audioBuf used for receiving audio data from WS message
@@ -194,17 +188,17 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	gotPCM := (*gotPCMPtr)[:0]
 	defer audioBufPool.Put(gotPCMPtr)
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
-				t.log.Info("Context done", zap.String("op", op))
+			case <-ctx.Done():
+				s.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
-					t.log.Error("Failed to read message",
+					s.log.Error("Failed to read message",
 						zap.String("op", op),
 						zap.Error(err))
 					return
@@ -214,7 +208,7 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				t.log.Info("Got PCM",
+				s.log.Info("Got PCM",
 					zap.String("op", op),
 					zap.Int("len", len(msg)))
 
@@ -222,7 +216,7 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 				audioBuf.Write(gotPCM)
 			}
 		}
-	})
+	}()
 
 	// resBuf used for containing all parsed text from Vosk response
 	resBuf := ringBufPool.Get().(*rb.RingBuffer[byte])
@@ -247,11 +241,12 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 	estEnd := 0
 	skipCnt := 0
 	end := (defaultLength / 4) - trashLen
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
-				t.log.Info("Context done", zap.String("op", op))
+			case <-ctx.Done():
+				s.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				if audioBuf.Len() == 0 {
@@ -266,36 +261,38 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 				cut := audioBuf.Read(sendPCM)
 				pcm := sendPCM[:cut]
 
-				t.processAudio(pcm, resBuf, int16Smp, &start, &estEnd, &end, &skipCnt)
+				s.processAudio(pcm, resBuf, int16Smp, &start, &estEnd, &end, &skipCnt)
 			}
 		}
-	})
+	}()
 
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
-				t.log.Info("Context done", zap.String("op", op))
+			case <-ctx.Done():
+				s.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				cut := resBuf.Read(res)
 				temp := res[:cut]
 
 				if err := conn.WriteMessage(websocket.TextMessage, temp); err != nil {
-					t.log.Error("Failed to write message",
+					s.log.Error("Failed to write message",
 						zap.String("op", op),
 						zap.Error(err))
 					return
 				}
 
-				t.log.Info("Sent message",
+				s.log.Info("Sent message",
 					zap.String("op", op),
 					zap.Int("len", len(res)))
 			}
 		}
-	})
+	}()
 
-	wg.Wait()
+	<-ctx.Done()
+	s.log.Info("Context done", zap.String("op", op))
 }
 
 // processAudio send audio data to Vosk and send text to buffer
@@ -304,26 +301,26 @@ func (t *STT) STT(w http.ResponseWriter, r *http.Request) {
 // cursors: start - start of sliding window, estEnd - estimated end of sliding window,
 // end - end of sliding window, skipCnt - counter for skipping audio data
 // skipCnt used for waiting vosk to finish processing last word in current window
-func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, estEnd, end, skipCnt *int) {
+func (s *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samples []int16, start, estEnd, end, skipCnt *int) {
 	const op = "workers.STT.processAudio"
 
 	if len(pcm) == 0 {
-		t.log.Warn("Empty pcm float32 data",
+		s.log.Warn("Empty pcm float32 data",
 			zap.String("op", op))
 		return
 	}
 
 	float32ToVosk(pcm, int16Samples)
 	if len(int16Samples) == 0 {
-		t.log.Warn("Empty pcm int16 data",
+		s.log.Warn("Empty pcm int16 data",
 			zap.String("op", op))
 		return
 	}
 	bytesSamples := unsafe.Slice((*byte)(unsafe.Pointer(&int16Samples[0])), len(pcm)*2)
 
-	final := t.vosk.AcceptWaveform(bytesSamples)
+	final := s.vosk.AcceptWaveform(bytesSamples)
 
-	partial := t.vosk.PartialResult()
+	partial := s.vosk.PartialResult()
 	trimmed := unsafe.Slice(unsafe.StringData(partial), len(partial))
 	trimJSON(&trimmed, []byte(`"partial" : "`))
 
@@ -339,7 +336,7 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 	if final == 1 {
 		resBuf.Write(trimmed[curStart:])
 
-		t.log.Info("Write FINAL data",
+		s.log.Info("Write FINAL data",
 			zap.String("op", op),
 			zap.Int("start", curStart),
 			zap.Int("end", curEnd))
@@ -348,12 +345,12 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 		*end = (defaultLength / 4) - trashLen
 		*skipCnt = 0
 
-		t.vosk.Reset()
+		s.vosk.Reset()
 		return
 	}
 
 	if len(trimmed) < curStart {
-		t.log.Info("Vosk partial shrunk, resetting state",
+		s.log.Info("Vosk partial shrunk, resetting state",
 			zap.String("op", op),
 			zap.Int("current length", len(trimmed)),
 			zap.Int("curStart", curStart))
@@ -366,7 +363,7 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 	}
 
 	if len(trimmed) < curEnd {
-		t.log.Warn("Trimmed text is too short",
+		s.log.Warn("Trimmed text is too short",
 			zap.String("op", op),
 			zap.Int("len", len(trimmed)),
 			zap.Int("curEnd", curEnd))
@@ -386,7 +383,7 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 
 		resBuf.Write(trimmed[curStart:curEnd])
 
-		t.log.Info("Write data",
+		s.log.Info("Write data",
 			zap.String("op", op),
 			zap.Int("start", curStart),
 			zap.Int("end", curEnd))
@@ -408,7 +405,7 @@ func (t *STT) processAudio(pcm []float32, resBuf *rb.RingBuffer[byte], int16Samp
 	*estEnd = curEstEnd
 	*skipCnt = curSkip
 
-	t.log.Info("Skip count",
+	s.log.Info("Skip count",
 		zap.String("op", op),
 		zap.Int("skipCnt", curSkip))
 }

@@ -9,15 +9,13 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"os/exec"
-	"strings"
-	"sync"
+	"strconv"
 	"time"
 	"unsafe"
 
 	rb "btrl/internal/ringbuffer"
+
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
@@ -94,43 +92,32 @@ type Inflector struct {
 	client *http.Client
 	log    *zap.Logger
 	upg    websocket.Upgrader
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // NewInflector creates a new Inflector worker
 func NewInflector(log *zap.Logger) *Inflector {
-	ctx, cancel := context.WithCancel(context.Background())
 	upg := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
 	}
 	return &Inflector{
-		Name:   "Inflector",
-		log:    log,
-		upg:    upg,
-		ctx:    ctx,
-		cancel: cancel,
+		Name: "Inflector",
+		log:  log,
+		upg:  upg,
 	}
 }
 
 // GetName returns the name of the worker
 // Used for logging
-func (t *Inflector) GetName() string {
-	return t.Name
+func (i *Inflector) GetName() string {
+	return i.Name
 }
 
 // Register the worker endpoints on the http.ServeMux
-func (t *Inflector) Register(m *http.ServeMux) {
-	m.HandleFunc("/inflector", t.Inflector)
-	m.HandleFunc("/inflector/setOptions", t.setOptions)
-}
-
-// Close cancels the context
-// Cancel context is used for shutdown WS connections
-func (t *Inflector) Close(ctx context.Context) {
-	t.cancel()
+func (i *Inflector) Register(m *http.ServeMux) {
+	m.HandleFunc("/inflector", i.Inflector)
+	m.HandleFunc("/inflector/setOptions", i.setOptions)
 }
 
 // setOptions sets options of the worker
@@ -138,7 +125,7 @@ func (t *Inflector) Close(ctx context.Context) {
 // Call is URL or path to script, which inflects text
 // Model is name of the AI model
 // ReadTimeout is a timeout during which messages are collected
-func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
+func (i *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	const op = "inflector.setCall"
 
 	var req struct {
@@ -148,7 +135,7 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		t.log.Error("Failed to decode request",
+		i.log.Error("Failed to decode request",
 			zap.String("op", op),
 			zap.Error(err))
 		http.Error(w, "Failed to decode request",
@@ -156,30 +143,30 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t.model = req.Model
+	i.model = req.Model
 
 	if req.ReadTimeout == 0 {
 		req.ReadTimeout = 2
 	}
 
-	t.mode = inflectorModeAPI
+	i.mode = inflectorModeAPI
 	if has := findAPIPrefix(req.Call); !has {
-		t.mode = inflectorModeScript
+		i.mode = inflectorModeScript
 	}
 
-	t.readTimeout = time.Duration(req.ReadTimeout) * time.Second
+	i.readTimeout = time.Duration(req.ReadTimeout) * time.Second
 
 	client := &http.Client{
-		Timeout: t.readTimeout,
+		Timeout: i.readTimeout,
 	}
 	client.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	t.client = client
-	t.call = req.Call
+	i.client = client
+	i.call = req.Call
 
-	t.log.Info("Set options",
+	i.log.Info("Set options",
 		zap.String("op", op),
 		zap.String("call", req.Call),
 		zap.String("model", req.Model),
@@ -188,40 +175,41 @@ func (t *Inflector) setOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (t *Inflector) initTranslator() {
+func (i *Inflector) initTranslator() {
 	const op = "inflector.initTranslator"
 
-	t.call = ""
+	i.call = ""
 }
 
 // Inflector makes audio from text
 // Use WebSockets for streaming
 // Returned bytes are audio data
-func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
+func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	const op = "inflector.Inflector"
 
-	defer t.log.Debug("Leave", zap.String("op", op))
+	defer i.log.Debug("Leave", zap.String("op", op))
 
-	if t.call == "" {
-		t.call = "http://localhost:11434/api/generate"
-		t.model = "gemma2:2b_Q4_K_M"
-		t.readTimeout = 60 * time.Second
-		t.mode = inflectorModeAPI
-		t.client = nil
+	if i.call == "" {
+		i.call = "http://localhost:11434/api/generate"
+		i.model = "gemma2:2b_Q4_K_M"
+		i.readTimeout = 60 * time.Second
+		i.mode = inflectorModeAPI
+		i.client = nil
 	}
 
-	t.log.Info("Inflector request",
+	i.log.Info("Inflector request",
 		zap.String("op", op),
-		zap.String("call", t.call),
-		zap.String("model", t.model),
-		zap.String("readTimeout", fmt.Sprintf("%d", t.readTimeout)),
-		zap.String("mode", fmt.Sprintf("%d", t.mode)))
+		zap.String("call", i.call),
+		zap.String("model", i.model),
+		zap.String("readTimeout", fmt.Sprintf("%d", i.readTimeout)),
+		zap.String("mode", fmt.Sprintf("%d", i.mode)))
 
-	t.ctx = r.Context()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 
-	conn, err := t.upg.Upgrade(w, r, nil)
+	conn, err := i.upg.Upgrade(w, r, nil)
 	if err != nil {
-		t.log.Error("Failed to upgrade connection",
+		i.log.Error("Failed to upgrade connection",
 			zap.String("op", op),
 			zap.Error(err))
 		http.Error(w, "Failed to upgrade connection",
@@ -230,36 +218,34 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	t.log.Info("Upgraded connection", zap.String("op", op))
+	i.log.Info("Upgraded connection", zap.String("op", op))
 
 	origBuf := rb.NewRB[byte](defaultLength)
 	tranBuf := rb.NewRB[byte](defaultLength)
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
-				t.log.Info("Context done", zap.String("op", op))
+			case <-ctx.Done():
+				i.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
-					t.log.Error("Failed to read message",
+					i.log.Error("Failed to read message",
 						zap.String("op", op),
 						zap.Error(err))
 					return
 				}
 
-				var data WSMessage
-				if err := json.Unmarshal(msg, &data); err != nil {
-					t.log.Error("Failed to unmarshal message",
+				data, err := unmarshalWSMessage(msg)
+				if err != nil {
+					i.log.Error("Failed to unmarshal message",
 						zap.String("op", op),
 						zap.Error(err))
 					return
 				}
-
-				// TODO: custom json parser instead of json
 
 				origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
 				tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
@@ -267,13 +253,13 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				origBuf.Write(origBytes)
 				tranBuf.Write(tranBytes)
 
-				t.log.Info("Message received",
+				i.log.Info("Message received",
 					zap.String("op", op),
 					zap.String("original", data.Original),
 					zap.String("translated", data.Translated))
 			}
 		}
-	})
+	}()
 
 	origFinalPtr := bufPool.Get().(*[]byte)
 	tranFinalPtr := bufPool.Get().(*[]byte)
@@ -289,11 +275,12 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	tranFinal := (*tranFinalPtr)[:0]
 	buf := (*bufPtr)
 
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
-				t.log.Info("Context done", zap.String("op", op))
+			case <-ctx.Done():
+				i.log.Info("Context done", zap.String("op", op))
 				return
 			default:
 				if tranBuf.Len() == 0 {
@@ -311,22 +298,22 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				nOrig := origBuf.Read(buf)
 				origFinal = append(origFinal, buf[:nOrig]...)
 
-				inflected, err := t.sendInflect(origFinal, tranFinal)
+				inflected, err := i.sendInflect(origFinal, tranFinal)
 				if err != nil {
-					t.log.Error("Failed to send request",
+					i.log.Error("Failed to send request",
 						zap.String("op", op),
 						zap.Error(err),
 						zap.String("orig", unsafe.String(unsafe.SliceData(origFinal), len(origFinal))),
 						zap.String("tran", unsafe.String(unsafe.SliceData(tranFinal), len(tranFinal))))
 				}
 
-				t.log.Info("Send inflected text",
+				i.log.Info("Send inflected text",
 					zap.String("op", op),
 					zap.String("inflected", unsafe.String(unsafe.SliceData(inflected), len(inflected))))
 
 				err = conn.WriteMessage(websocket.TextMessage, inflected)
 				if err != nil {
-					t.log.Error("Failed to write message", zap.Error(err))
+					i.log.Error("Failed to write message", zap.Error(err))
 					return
 				}
 
@@ -334,14 +321,15 @@ func (t *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				tranFinal = tranFinal[:0]
 			}
 		}
-	})
+	}()
 
-	wg.Wait()
+	<-ctx.Done()
+	i.log.Info("Context done", zap.String("op", op))
 }
 
 // sendInflect sends inflected text to the server
 // return inflicted text and error
-func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
+func (i *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 	const op = "inflector.sendInflect"
 	if len(tran) == 0 {
 		return nil, nil
@@ -350,16 +338,16 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 	origStr := unsafe.String(unsafe.SliceData(orig), len(orig))
 	tranStr := unsafe.String(unsafe.SliceData(tran), len(tran))
 
-	call := t.call
+	call := i.call
 
-	if t.client == nil {
+	if i.client == nil {
 		client := &http.Client{
-			Timeout: t.readTimeout,
+			Timeout: i.readTimeout,
 		}
-		t.client = client
+		i.client = client
 	}
 
-	switch t.mode {
+	switch i.mode {
 	case inflectorModeScript:
 		payload := map[string]string{
 			"original":   origStr,
@@ -371,7 +359,7 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
 		}
 
-		resBytes, err := t.callScript(call, jsonData)
+		resBytes, err := i.callScript(call, jsonData, i.log)
 		if err != nil {
 			return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
 		}
@@ -391,7 +379,7 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 
 	case inflectorModeAPI:
 		body := RequestBody{
-			Model:  t.model,
+			Model:  i.model,
 			System: prompt,
 			Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
 			Stream: false,
@@ -408,15 +396,15 @@ func (t *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
 		}
 
-		resBytes, err := t.callAPI(call, jsonData, origStr, tranStr)
+		resBytes, err := i.callAPI(call, jsonData, origStr, tranStr)
 		if err != nil {
 			return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
 		}
 		return resBytes, nil
 
 	default:
-		t.log.Error("Unknown mode", zap.Int("mode", t.mode))
-		return nil, fmt.Errorf("%s: unknown mode: %d", op, t.mode)
+		i.log.Error("Unknown mode", zap.Int("mode", i.mode))
+		return nil, fmt.Errorf("%s: unknown mode: %d", op, i.mode)
 	}
 }
 
@@ -444,15 +432,15 @@ func isSpace(b byte) bool {
 
 // sendHTTP sends text for inflecting to the server
 // return inflicted text and error
-func (t *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string) ([]byte, error) {
+func (i *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string) ([]byte, error) {
 	const op = "inflector.callAPI"
 
-	t.log.Info("Send request",
+	i.log.Info("Send request",
 		zap.String("op", op),
 		zap.String("url", url),
 		zap.String("body", fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr)))
 
-	resp, err := t.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := i.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
 	}
@@ -470,7 +458,7 @@ func (t *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string
 		return nil, fmt.Errorf("%s: failed to decode response body: %w", op, err)
 	}
 
-	t.log.Info("Received response",
+	i.log.Info("Received response",
 		zap.String("op", op),
 		zap.String("response", res.Response))
 
@@ -480,49 +468,87 @@ func (t *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string
 	return resBytes, nil
 }
 
-func (t *Inflector) callScript(scriptCall string, jsonData []byte) ([]byte, error) {
+// callScript calls script for inflecting text
+func (i *Inflector) callScript(scriptCall string, jsonData []byte, log *zap.Logger) ([]byte, error) {
 	const op = "inflector.callScript"
 
-	t.log.Info("Call script",
-		zap.String("op", op),
-		zap.String("script call", scriptCall))
-
-	parts := strings.Split(scriptCall, " ")
-
-	cmd := exec.Command(parts[0], parts[1:]...)
-
-	stdin, err := cmd.StdinPipe()
+	res, err := callScript(scriptCall, jsonData, log)
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to get stdin pipe: %w", op, err)
+		return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
 	}
 
-	stdout, err := cmd.StdoutPipe()
+	trimSpaceBytes(&res)
+
+	return res, nil
+}
+
+// findJSONKey finds key in raw json bytes
+// Support escaped values and quotes
+// Returned unquoted value
+func findJSONKey(msg []byte, key []byte) (string, error) {
+	const op = "workers.findJSONKey"
+
+	idx := bytes.Index(msg, key)
+	if idx == -1 {
+		return "", fmt.Errorf("%s: failed to find %q key", op, key)
+	}
+
+	keyEnd := idx + len(key)
+
+	start := bytes.IndexByte(msg[keyEnd:], '"')
+	if start == -1 {
+		return "", fmt.Errorf("%s: failed to find '", op)
+	}
+	start += keyEnd
+
+	curStart := start + 1 // skip '"'
+	end := 0
+	for {
+		estEnd := bytes.IndexByte(msg[curStart:], '"')
+		if estEnd == -1 {
+			return "", fmt.Errorf("%s: failed to find '", op)
+		}
+		estEnd += start
+		if msg[estEnd-1] == '\\' && msg[estEnd-2] != '\\' { // user escaped '"', not json
+			curStart = estEnd + 1
+			continue
+		} else {
+			end = estEnd
+			break
+		}
+	}
+
+	end++ // add '"' for strconv.Unquote
+	rawBytes := msg[start:end]
+	rawStr := unsafe.String(unsafe.SliceData(rawBytes), len(rawBytes))
+
+	unquotedStr, err := strconv.Unquote(rawStr)
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to get stdout pipe: %w", op, err)
+		return "", fmt.Errorf("%s: failed to unquote original message: %w", op, err)
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("%s: failed to start script: %w", op, err)
-	}
+	return unquotedStr, nil
+}
 
-	if _, err := stdin.Write(jsonData); err != nil {
-		return nil, fmt.Errorf("%s: failed to write to stdin: %w", op, err)
-	}
+// unmarshalWSMessage unmarshals raw websocket message
+// Used 'original' and 'translated' keys
+// Returned WSMessage struct with original and translated texts
+func unmarshalWSMessage(msg []byte) (WSMessage, error) {
+	const op = "workers.unmarshalWSMessage"
+	var data WSMessage
 
-	if err := stdin.Close(); err != nil {
-		return nil, fmt.Errorf("%s: failed to close stdin: %w", op, err)
-	}
-
-	resBytes, err := io.ReadAll(stdout)
+	original, err := findJSONKey(msg, []byte(`"original":`))
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to read stdout: %w", op, err)
+		return data, fmt.Errorf("%s: failed to find original message: %w", op, err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("%s: failed to wait for script: %w", op, err)
+	translated, err := findJSONKey(msg, []byte(`"translated":`))
+	if err != nil {
+		return data, fmt.Errorf("%s: failed to find translated message: %w", op, err)
 	}
 
-	trimSpaceBytes(&resBytes)
+	data.Original = original
+	data.Translated = translated
 
-	return resBytes, nil
+	return data, nil
 }

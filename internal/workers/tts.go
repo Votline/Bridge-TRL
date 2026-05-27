@@ -9,11 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"os/exec"
-	"strings"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -66,27 +62,22 @@ type TTS struct {
 	// client is a client for send requests
 	client *http.Client
 
-	log    *zap.Logger
-	upg    websocket.Upgrader
-	ctx    context.Context
-	cancel context.CancelFunc
+	log *zap.Logger
+	upg websocket.Upgrader
 }
 
 // NewTTS creates a new TTS worker
 func NewTTS(log *zap.Logger) *TTS {
-	ctx, cancel := context.WithCancel(context.Background())
 	upg := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
 	}
 	return &TTS{
-		Name:   "TTS",
-		call:   "",
-		log:    log,
-		upg:    upg,
-		ctx:    ctx,
-		cancel: cancel,
+		Name: "TTS",
+		call: "",
+		log:  log,
+		upg:  upg,
 	}
 }
 
@@ -100,12 +91,6 @@ func (t *TTS) GetName() string {
 func (t *TTS) Register(m *http.ServeMux) {
 	m.HandleFunc("/tts", t.TTS)
 	m.HandleFunc("/tts/setOptions", t.setOptions)
-}
-
-// Close cancels the context
-// Cancel context is used for shutdown WS connections
-func (t *TTS) Close(ctx context.Context) {
-	t.cancel()
 }
 
 // setOptions sets options of the worker
@@ -205,8 +190,6 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 		zap.String("modelName", t.modelName),
 		zap.String("readTimeout", fmt.Sprintf("%d", t.readTimeout)))
 
-	t.ctx = r.Context()
-
 	conn, err := t.upg.Upgrade(w, r, nil)
 	if err != nil {
 		t.log.Error("Failed to upgrade connection",
@@ -218,15 +201,18 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	t.log.Info("Upgraded connection")
 
 	comBuf := rb.NewRB[byte](defaultLength)
 
-	var wg sync.WaitGroup
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				t.log.Info("Context done")
 				return
 			default:
@@ -241,7 +227,7 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 				comBuf.Write(msg)
 			}
 		}
-	})
+	}()
 
 	textBufPtr := bufPool.Get().(*[]byte)
 	bytesPCMptr := bufPool.Get().(*[]byte)
@@ -256,10 +242,11 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 		audioBufPool.Put(floatBufPtr)
 	}()
 
-	wg.Go(func() {
+	go func() {
+		defer cancel()
 		for {
 			select {
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				t.log.Info("Context done")
 				return
 			default:
@@ -313,56 +300,18 @@ func (t *TTS) TTS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	})
+	}()
 
-	wg.Wait()
+	<-ctx.Done()
+	t.log.Info("Context done", zap.String("op", op))
 }
 
+// callScript calls script for making audio from text
 func (t *TTS) callScript(scriptCall string, textBuf []byte) ([]byte, error) {
-	const op = "tts.callScript"
-
-	parts := strings.Split(scriptCall, " ")
-
-	cmd := exec.Command(parts[0], parts[1:]...)
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("%s: failed to get stdin pipe: %w", op, err)
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("%s: failed to get stdout pipe: %w", op, err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("%s: failed to start script: %w", op, err)
-	}
-
-	if _, err := stdin.Write(textBuf); err != nil {
-		return nil, fmt.Errorf("%s: failed to write to stdin: %w", op, err)
-	}
-
-	if err := stdin.Close(); err != nil {
-		return nil, fmt.Errorf("%s: failed to close stdin: %w", op, err)
-	}
-
-	resBytes, err := io.ReadAll(stdout)
-	if err != nil {
-		return nil, fmt.Errorf("%s: failed to read stdout: %w", op, err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("%s: failed to wait for script: %w", op, err)
-	}
-
-	t.log.Info("Script finished",
-		zap.String("op", op),
-		zap.Int("res length", len(resBytes)))
-
-	return resBytes, nil
+	return callScript(scriptCall, textBuf, t.log)
 }
 
+// callAPI calls API for making audio from text
 func (t *TTS) callAPI(url string, textBuf []byte) ([]byte, error) {
 	const op = "tts.callAPI"
 
