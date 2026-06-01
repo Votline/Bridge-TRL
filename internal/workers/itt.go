@@ -5,6 +5,7 @@ package workers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"unsafe"
 
@@ -21,6 +22,9 @@ type ITT struct {
 	// rec is a recognizer for image to text
 	rec *gosseract.Client
 
+	// prefLang is a preferred language for recognizing text
+	prefLang string
+
 	log *zap.Logger
 	upg websocket.Upgrader
 }
@@ -36,7 +40,6 @@ func NewITT(log *zap.Logger) *ITT {
 	}
 
 	rec := gosseract.NewClient()
-	rec.SetLanguage("rus", "eng")
 
 	return &ITT{
 		Name: "ITT",
@@ -55,6 +58,41 @@ func (i *ITT) GetName() string {
 // Register the worker endpoints on the http.ServeMux
 func (i *ITT) Register(m *http.ServeMux) {
 	m.HandleFunc("/itt", i.ITT)
+	m.HandleFunc("/itt/setAudioLanguage", i.setAudioLang)
+}
+
+func (i *ITT) setAudioLang(w http.ResponseWriter, r *http.Request) {
+	const op = "workeri.setOptions"
+
+	req := struct {
+		AudioLang string `json:"audioLang"`
+	}{}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		i.log.Error("Failed to decode request",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to decode request",
+			http.StatusInternalServerError)
+		return
+	}
+
+	i.log.Info("Set audio language",
+		zap.String("op", op),
+		zap.String("audioLang", req.AudioLang))
+
+	if err := i.rec.SetLanguage(req.AudioLang); err != nil {
+		i.log.Error("Failed to set language",
+			zap.String("op", op),
+			zap.Error(err))
+		http.Error(w, "Failed to set language",
+			http.StatusInternalServerError)
+		return
+	}
+
+	i.prefLang = req.AudioLang
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // ITT makes image to text
@@ -68,6 +106,11 @@ func (i *ITT) ITT(w http.ResponseWriter, r *http.Request) {
 
 	i.log.Info("ITT request",
 		zap.String("op", op))
+
+	if i.prefLang == "" {
+		i.prefLang = "ru"
+		i.rec.SetLanguage(i.prefLang)
+	}
 
 	conn, err := i.upg.Upgrade(w, r, nil)
 	if err != nil {

@@ -291,10 +291,6 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				nTran := tranBuf.Read(buf)
 				tranFinal = append(tranFinal, buf[:nTran]...)
 
-				if !bytes.ContainsAny(buf[:nTran], ".?!") {
-					continue
-				}
-
 				nOrig := origBuf.Read(buf)
 				origFinal = append(origFinal, buf[:nOrig]...)
 
@@ -335,9 +331,6 @@ func (i *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	origStr := unsafe.String(unsafe.SliceData(orig), len(orig))
-	tranStr := unsafe.String(unsafe.SliceData(tran), len(tran))
-
 	call := i.call
 
 	if i.client == nil {
@@ -347,65 +340,107 @@ func (i *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 		i.client = client
 	}
 
-	switch i.mode {
-	case inflectorModeScript:
-		payload := map[string]string{
-			"original":   origStr,
-			"translated": tranStr,
+	step := 128
+	resultPtr := bufPool.Get().(*[]byte)
+	result := (*resultPtr)[:0]
+	defer bufPool.Put(resultPtr)
+
+	for len(orig) > 0 && len(tran) > 0 {
+		origStartIdx := 0
+		if step > len(orig) {
+			origStartIdx = len(orig)
+		} else {
+			origStartIdx = bytes.IndexByte(orig[step:], ' ')
+			if origStartIdx == -1 {
+				origStartIdx = len(orig)
+			} else {
+				origStartIdx += step
+			}
 		}
+		origSpliced := orig[:origStartIdx]
+		orig = orig[origStartIdx:]
 
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+		tranStartIdx := 0
+		if step > len(tran) {
+			tranStartIdx = len(tran)
+		} else {
+			tranStartIdx = bytes.IndexByte(tran[step:], ' ')
+			if tranStartIdx == -1 {
+				tranStartIdx = len(tran)
+			} else {
+				tranStartIdx += step
+			}
 		}
+		tranSpliced := tran[:tranStartIdx]
+		tran = tran[tranStartIdx:]
 
-		resBytes, err := i.callScript(call, jsonData, i.log)
-		if err != nil {
-			return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
+		origStr := unsafe.String(unsafe.SliceData(origSpliced), len(origSpliced))
+		tranStr := unsafe.String(unsafe.SliceData(tranSpliced), len(tranSpliced))
+		switch i.mode {
+		case inflectorModeScript:
+			payload := map[string]string{
+				"original":   origStr,
+				"translated": tranStr,
+			}
+
+			jsonData, err := json.Marshal(payload)
+			if err != nil {
+				return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+			}
+
+			resBytes, err := i.callScript(call, jsonData, i.log)
+			if err != nil {
+				return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
+			}
+
+			var res struct {
+				Response string `json:"response"`
+			}
+
+			if err := json.Unmarshal(resBytes, &res); err != nil {
+				return nil, fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
+			}
+
+			resBytes = unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
+			trimSpaceBytes(&resBytes)
+
+			result = append(result, resBytes...)
+			result = append(result, ' ')
+
+		case inflectorModeAPI:
+			body := RequestBody{
+				Model:  i.model,
+				System: prompt,
+				Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
+				Stream: false,
+				Options: Options{
+					Temperature:   0.1,
+					NumPredict:    512,
+					TopP:          0.9,
+					RepeatPenalty: 1.1,
+				},
+			}
+
+			jsonData, err := json.Marshal(body)
+			if err != nil {
+				return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+			}
+
+			resBytes, err := i.callAPI(call, jsonData, origStr, tranStr)
+			if err != nil {
+				return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+			}
+
+			result = append(result, resBytes...)
+			result = append(result, ' ')
+
+		default:
+			i.log.Error("Unknown mode", zap.Int("mode", i.mode))
+			return nil, fmt.Errorf("%s: unknown mode: %d", op, i.mode)
 		}
-
-		var res struct {
-			Response string `json:"response"`
-		}
-
-		if err := json.Unmarshal(resBytes, &res); err != nil {
-			return nil, fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
-		}
-
-		resBytes = unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
-		trimSpaceBytes(&resBytes)
-
-		return resBytes, nil
-
-	case inflectorModeAPI:
-		body := RequestBody{
-			Model:  i.model,
-			System: prompt,
-			Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
-			Stream: false,
-			Options: Options{
-				Temperature:   0.1,
-				NumPredict:    512,
-				TopP:          0.9,
-				RepeatPenalty: 1.1,
-			},
-		}
-
-		jsonData, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
-		}
-
-		resBytes, err := i.callAPI(call, jsonData, origStr, tranStr)
-		if err != nil {
-			return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
-		}
-		return resBytes, nil
-
-	default:
-		i.log.Error("Unknown mode", zap.Int("mode", i.mode))
-		return nil, fmt.Errorf("%s: unknown mode: %d", op, i.mode)
 	}
+
+	return result, nil
 }
 
 // trimSpaceBytes trims spaces from data by pointer
@@ -508,7 +543,7 @@ func findJSONKey(msg []byte, key []byte) (string, error) {
 		if estEnd == -1 {
 			return "", fmt.Errorf("%s: failed to find '", op)
 		}
-		estEnd += start
+		estEnd += curStart
 		if msg[estEnd-1] == '\\' && msg[estEnd-2] != '\\' { // user escaped '"', not json
 			curStart = estEnd + 1
 			continue
