@@ -8,7 +8,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -226,38 +228,47 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer cancel()
 		for {
-			select {
-			case <-ctx.Done():
-				i.log.Info("Context done", zap.String("op", op))
-				return
-			default:
-				_, msg, err := conn.ReadMessage()
-				if err != nil {
-					i.log.Error("Failed to read message",
-						zap.String("op", op),
-						zap.Error(err))
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				if ctx.Err() != nil {
+					i.log.Info("Context done", zap.String("op", op))
 					return
 				}
 
-				data, err := unmarshalWSMessage(msg)
-				if err != nil {
-					i.log.Error("Failed to unmarshal message",
-						zap.String("op", op),
-						zap.Error(err))
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					i.log.Warn("Connection closed", zap.String("op", op))
 					return
 				}
 
-				origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
-				tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
 
-				origBuf.Write(origBytes)
-				tranBuf.Write(tranBytes)
-
-				i.log.Info("Message received",
+				i.log.Error("Failed to read message",
 					zap.String("op", op),
-					zap.String("original", data.Original),
-					zap.String("translated", data.Translated))
+					zap.Error(err))
+				return
 			}
+
+			data, err := unmarshalWSMessage(msg)
+			if err != nil {
+				i.log.Error("Failed to unmarshal message",
+					zap.String("op", op),
+					zap.Error(err))
+				return
+			}
+
+			origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
+			tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
+
+			origBuf.Write(origBytes)
+			tranBuf.Write(tranBytes)
+
+			i.log.Info("Message received",
+				zap.String("op", op),
+				zap.String("original", data.Original),
+				zap.String("translated", data.Translated))
 		}
 	}()
 
@@ -274,6 +285,9 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	origFinal := (*origFinalPtr)[:0]
 	tranFinal := (*tranFinalPtr)[:0]
 	buf := (*bufPtr)
+
+	resultPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(resultPtr)
 
 	go func() {
 		defer cancel()
@@ -294,7 +308,7 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				nOrig := origBuf.Read(buf)
 				origFinal = append(origFinal, buf[:nOrig]...)
 
-				inflected, err := i.sendInflect(origFinal, tranFinal)
+				inflected, err := i.sendInflect(origFinal, tranFinal, resultPtr)
 				if err != nil {
 					i.log.Error("Failed to send request",
 						zap.String("op", op),
@@ -325,7 +339,7 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 
 // sendInflect sends inflected text to the server
 // return inflicted text and error
-func (i *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
+func (i *Inflector) sendInflect(orig, tran []byte, buf *[]byte) ([]byte, error) {
 	const op = "inflector.sendInflect"
 	if len(tran) == 0 {
 		return nil, nil
@@ -341,9 +355,7 @@ func (i *Inflector) sendInflect(orig, tran []byte) ([]byte, error) {
 	}
 
 	step := 128
-	resultPtr := bufPool.Get().(*[]byte)
-	result := (*resultPtr)[:0]
-	defer bufPool.Put(resultPtr)
+	result := (*buf)[:0]
 
 	for len(orig) > 0 && len(tran) > 0 {
 		origStartIdx := 0
