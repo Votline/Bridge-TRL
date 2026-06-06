@@ -4,6 +4,7 @@
 package workers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -54,14 +55,20 @@ const (
 	inflectorModeAPI = -3
 
 	// prompt is a prompt for AI
-	prompt = `You are a strict linguistic engine.
-Task: Fix grammar, morphology, and syntax in the provided text.
-Constraints:
-1. Do NOT change the meaning.
-2. Do NOT use synonyms if the original word is grammatically correct.
-3. Output ONLY the corrected text.
-4. No explanations.
-5. The output MUST be in the same language as the TRANSLATION.`
+	prompt = `
+	You are a universal text polisher.
+Task: Correct the 'Translated' text using the 'Original' text as a semantic and structural reference.
+
+Instructions:
+1. Fix all morphological and syntactical errors in 'Translated'.
+2. Align gender, number, and case agreements based on the context of 'Original'.
+3. The output MUST be in the same language as the 'Translated' input.
+4. Keep the style, but ensure the flow is natural for a native speaker.
+5. Output ONLY the corrected text without any meta-talk or labels.
+
+Original: {orig}
+Translated: {tran}
+	`
 )
 
 // Inflector struct for implementing worker
@@ -228,47 +235,48 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer cancel()
 		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				if ctx.Err() != nil {
-					i.log.Info("Context done", zap.String("op", op))
+			select {
+			case <-ctx.Done():
+				i.log.Info("Context done", zap.String("op", op))
+				return
+			default:
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						i.log.Warn("Connection closed", zap.String("op", op))
+						return
+					}
+
+					var netErr net.Error
+					if errors.As(err, &netErr) && netErr.Timeout() {
+						continue
+					}
+
+					i.log.Error("Failed to read message",
+						zap.String("op", op),
+						zap.Error(err))
 					return
 				}
 
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					i.log.Warn("Connection closed", zap.String("op", op))
+				data, err := unmarshalWSMessage(msg)
+				if err != nil {
+					i.log.Error("Failed to unmarshal message",
+						zap.String("op", op),
+						zap.Error(err))
 					return
 				}
 
-				var netErr net.Error
-				if errors.As(err, &netErr) && netErr.Timeout() {
-					continue
-				}
+				origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
+				tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
 
-				i.log.Error("Failed to read message",
+				origBuf.Write(origBytes)
+				tranBuf.Write(tranBytes)
+
+				i.log.Info("Message received",
 					zap.String("op", op),
-					zap.Error(err))
-				return
+					zap.String("original", data.Original),
+					zap.String("translated", data.Translated))
 			}
-
-			data, err := unmarshalWSMessage(msg)
-			if err != nil {
-				i.log.Error("Failed to unmarshal message",
-					zap.String("op", op),
-					zap.Error(err))
-				return
-			}
-
-			origBytes := unsafe.Slice(unsafe.StringData(data.Original), len(data.Original))
-			tranBytes := unsafe.Slice(unsafe.StringData(data.Translated), len(data.Translated))
-
-			origBuf.Write(origBytes)
-			tranBuf.Write(tranBytes)
-
-			i.log.Info("Message received",
-				zap.String("op", op),
-				zap.String("original", data.Original),
-				zap.String("translated", data.Translated))
 		}
 	}()
 
@@ -286,8 +294,9 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	tranFinal := (*tranFinalPtr)[:0]
 	buf := (*bufPtr)
 
-	resultPtr := bufPool.Get().(*[]byte)
-	defer bufPool.Put(resultPtr)
+	resultBuf := ringBufPool.Get().(*rb.RingBuffer[byte])
+	resultBuf.Reset()
+	defer ringBufPool.Put(resultBuf)
 
 	go func() {
 		defer cancel()
@@ -308,27 +317,60 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 				nOrig := origBuf.Read(buf)
 				origFinal = append(origFinal, buf[:nOrig]...)
 
-				inflected, err := i.sendInflect(origFinal, tranFinal, resultPtr)
-				if err != nil {
+				if err := i.sendInflect(origFinal, tranFinal, resultBuf); err != nil {
 					i.log.Error("Failed to send request",
 						zap.String("op", op),
 						zap.Error(err),
 						zap.String("orig", unsafe.String(unsafe.SliceData(origFinal), len(origFinal))),
 						zap.String("tran", unsafe.String(unsafe.SliceData(tranFinal), len(tranFinal))))
 				}
+				origFinal = origFinal[:0]
+				tranFinal = tranFinal[:0]
 
+				i.log.Debug("Inflect done",
+					zap.String("op", op))
+			}
+		}
+	}()
+
+	sendBufPtr := bufPool.Get().(*[]byte)
+	sendBuf := (*sendBufPtr)[:defaultLength]
+	defer bufPool.Put(sendBufPtr)
+	sendLen := defaultLength / 2
+	go func() {
+		defer cancel()
+		for {
+			select {
+			case <-ctx.Done():
+				i.log.Info("Context done", zap.String("op", op))
+				return
+			default:
+				if resultBuf.Len() < sendLen && !resultBuf.IsClosed() {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				} else if resultBuf.IsClosed() {
+					resultBuf.Open()
+				}
+
+				n := resultBuf.Read(sendBuf)
+				if n == 0 {
+					i.log.Warn("Result buffer is empty, leaving",
+						zap.String("op", op))
+					break
+				}
+
+				inflected := sendBuf[:n]
 				i.log.Info("Send inflected text",
 					zap.String("op", op),
 					zap.String("inflected", unsafe.String(unsafe.SliceData(inflected), len(inflected))))
 
 				err = conn.WriteMessage(websocket.TextMessage, inflected)
 				if err != nil {
-					i.log.Error("Failed to write message", zap.Error(err))
+					i.log.Error("Failed to write message",
+						zap.String("op", op),
+						zap.Error(err))
 					return
 				}
-
-				origFinal = origFinal[:0]
-				tranFinal = tranFinal[:0]
 			}
 		}
 	}()
@@ -339,13 +381,14 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 
 // sendInflect sends inflected text to the server
 // return inflicted text and error
-func (i *Inflector) sendInflect(orig, tran []byte, buf *[]byte) ([]byte, error) {
+func (i *Inflector) sendInflect(orig, tran []byte, result *rb.RingBuffer[byte]) error {
 	const op = "inflector.sendInflect"
 	if len(tran) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	call := i.call
+	result.Open()
 
 	if i.client == nil {
 		client := &http.Client{
@@ -354,132 +397,74 @@ func (i *Inflector) sendInflect(orig, tran []byte, buf *[]byte) ([]byte, error) 
 		i.client = client
 	}
 
-	step := 128
-	result := (*buf)[:0]
+	origStr := unsafe.String(unsafe.SliceData(orig), len(orig))
+	tranStr := unsafe.String(unsafe.SliceData(tran), len(tran))
 
-	for len(orig) > 0 && len(tran) > 0 {
-		origStartIdx := 0
-		if step > len(orig) {
-			origStartIdx = len(orig)
-		} else {
-			origStartIdx = bytes.IndexByte(orig[step:], ' ')
-			if origStartIdx == -1 {
-				origStartIdx = len(orig)
-			} else {
-				origStartIdx += step
-			}
+	switch i.mode {
+	case inflectorModeScript:
+		payload := map[string]string{
+			"original":   origStr,
+			"translated": tranStr,
 		}
-		origSpliced := orig[:origStartIdx]
-		orig = orig[origStartIdx:]
 
-		tranStartIdx := 0
-		if step > len(tran) {
-			tranStartIdx = len(tran)
-		} else {
-			tranStartIdx = bytes.IndexByte(tran[step:], ' ')
-			if tranStartIdx == -1 {
-				tranStartIdx = len(tran)
-			} else {
-				tranStartIdx += step
-			}
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("%s: failed to marshal request body: %w", op, err)
 		}
-		tranSpliced := tran[:tranStartIdx]
-		tran = tran[tranStartIdx:]
 
-		origStr := unsafe.String(unsafe.SliceData(origSpliced), len(origSpliced))
-		tranStr := unsafe.String(unsafe.SliceData(tranSpliced), len(tranSpliced))
-		switch i.mode {
-		case inflectorModeScript:
-			payload := map[string]string{
-				"original":   origStr,
-				"translated": tranStr,
-			}
-
-			jsonData, err := json.Marshal(payload)
-			if err != nil {
-				return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
-			}
-
-			resBytes, err := i.callScript(call, jsonData, i.log)
-			if err != nil {
-				return nil, fmt.Errorf("%s: failed to call script: %w", op, err)
-			}
-
-			var res struct {
-				Response string `json:"response"`
-			}
-
-			if err := json.Unmarshal(resBytes, &res); err != nil {
-				return nil, fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
-			}
-
-			resBytes = unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
-			trimSpaceBytes(&resBytes)
-
-			result = append(result, resBytes...)
-			result = append(result, ' ')
-
-		case inflectorModeAPI:
-			body := RequestBody{
-				Model:  i.model,
-				System: prompt,
-				Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
-				Stream: false,
-				Options: Options{
-					Temperature:   0.1,
-					NumPredict:    512,
-					TopP:          0.9,
-					RepeatPenalty: 1.1,
-				},
-			}
-
-			jsonData, err := json.Marshal(body)
-			if err != nil {
-				return nil, fmt.Errorf("%s: failed to marshal request body: %w", op, err)
-			}
-
-			resBytes, err := i.callAPI(call, jsonData, origStr, tranStr)
-			if err != nil {
-				return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
-			}
-
-			result = append(result, resBytes...)
-			result = append(result, ' ')
-
-		default:
-			i.log.Error("Unknown mode", zap.Int("mode", i.mode))
-			return nil, fmt.Errorf("%s: unknown mode: %d", op, i.mode)
+		resBytes, err := i.callScript(call, jsonData, i.log)
+		if err != nil {
+			return fmt.Errorf("%s: failed to call script: %w", op, err)
 		}
+
+		var res struct {
+			Response string `json:"response"`
+		}
+
+		if err := json.Unmarshal(resBytes, &res); err != nil {
+			return fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
+		}
+
+		resBytes = unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
+		trimSpaceBytes(&resBytes)
+
+		result.Write(resBytes)
+		result.Write([]byte{' '})
+
+	case inflectorModeAPI:
+		body := RequestBody{
+			Model:  i.model,
+			System: prompt,
+			Prompt: fmt.Sprintf("Original: %s\nTranslated: %s", origStr, tranStr),
+			Stream: true,
+			Options: Options{
+				Temperature:   0.1,
+				NumPredict:    512,
+				TopP:          0.9,
+				RepeatPenalty: 1.1,
+			},
+		}
+
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("%s: failed to marshal request body: %w", op, err)
+		}
+
+		if err := i.callAPI(call, jsonData, origStr, tranStr, result); err != nil {
+			return fmt.Errorf("%s: failed to send request: %w", op, err)
+		}
+
+	default:
+		i.log.Error("Unknown mode", zap.Int("mode", i.mode))
+		return fmt.Errorf("%s: unknown mode: %d", op, i.mode)
 	}
 
-	return result, nil
-}
-
-// trimSpaceBytes trims spaces from data by pointer
-func trimSpaceBytes(b *[]byte) {
-	tempB := *b
-
-	start := 0
-	end := len(tempB) - 1
-
-	for start < end && isSpace(tempB[start]) {
-		start++
-	}
-	for end > start && isSpace(tempB[end]) {
-		end--
-	}
-
-	*b = tempB[start : end+1]
-}
-
-// isSpace returns true if byte is space
-func isSpace(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+	return nil
 }
 
 // sendHTTP sends text for inflecting to the server
 // return inflicted text and error
-func (i *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string) ([]byte, error) {
+func (i *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string, result *rb.RingBuffer[byte]) error {
 	const op = "inflector.callAPI"
 
 	i.log.Info("Send request",
@@ -489,30 +474,46 @@ func (i *Inflector) callAPI(url string, jsonData []byte, origStr, tranStr string
 
 	resp, err := i.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to send request: %w", op, err)
+		return fmt.Errorf("%s: failed to send request: %w", op, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: request failed, status: %d", op, resp.StatusCode)
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		var streamRes struct {
+			Response string `json:"response"`
+			Message  struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done bool `json:"done"`
+		}
+
+		if err := json.Unmarshal(scanner.Bytes(), &streamRes); err != nil {
+			return fmt.Errorf("%s: failed to unmarshal response body: %w", op, err)
+		}
+
+		text := streamRes.Response
+		if text == "" {
+			text = streamRes.Message.Content
+		}
+
+		if text != "" {
+			textBytes := unsafe.Slice(unsafe.StringData(text), len(text))
+			result.Write(textBytes)
+		}
+
+		if streamRes.Done {
+			break
+		}
 	}
 
-	var res struct {
-		Response string `json:"response"`
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("%s: failed to read response body: %w", op, err)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, fmt.Errorf("%s: failed to decode response body: %w", op, err)
-	}
+	result.Close()
 
-	i.log.Info("Received response",
-		zap.String("op", op),
-		zap.String("response", res.Response))
-
-	resBytes := unsafe.Slice(unsafe.StringData(res.Response), len(res.Response))
-	trimSpaceBytes(&resBytes)
-
-	return resBytes, nil
+	return nil
 }
 
 // callScript calls script for inflecting text
@@ -598,4 +599,26 @@ func unmarshalWSMessage(msg []byte) (WSMessage, error) {
 	data.Translated = translated
 
 	return data, nil
+}
+
+// trimSpaceBytes trims spaces from data by pointer
+func trimSpaceBytes(b *[]byte) {
+	tempB := *b
+
+	start := 0
+	end := len(tempB) - 1
+
+	for start < end && isSpace(tempB[start]) {
+		start++
+	}
+	for end > start && isSpace(tempB[end]) {
+		end--
+	}
+
+	*b = tempB[start : end+1]
+}
+
+// isSpace returns true if byte is space
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
