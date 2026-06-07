@@ -1,0 +1,84 @@
+FROM archlinux:latest AS builder
+
+WORKDIR /app
+
+RUN pacman -Syu --noconfirm \
+    go git gcc pkg-config \
+    tesseract leptonica \
+    opus opusfile portaudio \
+    binutils make fakeroot sudo wget unzip \
+    && pacman -Scc --noconfirm
+
+RUN mkdir -p assets libs dicts
+
+RUN wget https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-linux-x86_64-0.3.45.zip && \
+    unzip vosk-linux-x86_64-0.3.45.zip && \
+    cp vosk-linux-x86_64-0.3.45/libvosk.so libs/ && \
+    mv vosk-linux-x86_64-0.3.45 assets/ && \
+    rm vosk-linux-x86_64-0.3.45.zip
+
+RUN wget https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip && \
+    unzip vosk-model-small-ru-0.22.zip -d assets/ && \
+    rm vosk-model-small-ru-0.22.zip
+
+RUN git clone --depth=1 --filter=blob:none --sparse \
+    https://github.com/Votline/EasyTranslate.git /tmp/easytranslate && \
+    cd /tmp/easytranslate && \
+    git sparse-checkout set dicts && \
+    cp -r dicts/* /app/dicts/ && \
+    rm -rf /tmp/easytranslate
+
+RUN useradd -m builduser && \
+    echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+USER builduser
+WORKDIR /home/builduser
+
+RUN git clone https://aur.archlinux.org/rhvoice.git && \
+    cd rhvoice && \
+    makepkg -si --noconfirm
+
+RUN git clone https://aur.archlinux.org/rhvoice-voice-russian-anna.git && \
+    cd rhvoice-voice-russian-anna && \
+    makepkg -si --noconfirm
+
+USER root
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+ENV CGO_ENABLED=1
+ENV CGO_CFLAGS="-I/app/assets/vosk-linux-x86_64-0.3.45 -I/usr/include"
+ENV CGO_LDFLAGS="-L/app/assets/vosk-linux-x86_64-0.3.45 -L/app/libs -lvosk -ltesseract -llept -lopus -lportaudio"
+
+RUN go build -o bridge_trl main.go
+
+
+FROM archlinux:latest
+WORKDIR /app
+
+RUN pacman -Syu --noconfirm \
+    tesseract \
+    tesseract-data-rus \
+    opus opusfile \
+    portaudio \
+    && pacman -Scc --noconfirm
+
+RUN ln -s /usr/share/tessdata/rus.traineddata /usr/share/tessdata/ru.traineddata
+
+COPY --from=builder /usr/bin/RHVoice-* /usr/bin/
+COPY --from=builder /usr/lib/librhvoice.so* /usr/lib/
+COPY --from=builder /usr/share/RHVoice /usr/share/RHVoice
+COPY --from=builder /etc/RHVoice /etc/RHVoice
+
+COPY --from=builder /app/bridge_trl .
+COPY --from=builder /app/libs libs
+COPY --from=builder /app/dicts dicts
+COPY --from=builder /app/assets assets
+
+ENV TESSDATA_PREFIX=/usr/share/tessdata/
+ENV LD_LIBRARY_PATH="/app/assets/vosk-linux-x86_64-0.3.45:/app/libs:/usr/lib:$LD_LIBRARY_PATH"
+
+CMD ["./bridge_trl"]

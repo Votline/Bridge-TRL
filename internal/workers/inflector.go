@@ -298,6 +298,7 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 	resultBuf.Reset()
 	defer ringBufPool.Put(resultBuf)
 
+	inflectDone := make(chan struct{}, 1)
 	go func() {
 		defer cancel()
 		for {
@@ -329,6 +330,8 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 
 				i.log.Debug("Inflect done",
 					zap.String("op", op))
+
+				inflectDone <- struct{}{}
 			}
 		}
 	}()
@@ -344,6 +347,27 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				i.log.Info("Context done", zap.String("op", op))
 				return
+			case <-inflectDone:
+				for resultBuf.Len() > 0 {
+					n := resultBuf.Read(sendBuf)
+					inflected := sendBuf[:n]
+					i.log.Info("Send inflected text after done",
+						zap.String("op", op),
+						zap.String("inflected", unsafe.String(unsafe.SliceData(inflected), len(inflected))))
+
+					if err = conn.WriteMessage(websocket.TextMessage, inflected); err != nil {
+						i.log.Error("Failed to write message after done",
+							zap.String("op", op),
+							zap.Error(err))
+						return
+					}
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"done": true}`)); err != nil {
+					i.log.Error("Failed to write message",
+						zap.String("op", op),
+						zap.Error(err))
+					return
+				}
 			default:
 				if resultBuf.Len() < sendLen && !resultBuf.IsClosed() {
 					time.Sleep(10 * time.Millisecond)
@@ -364,8 +388,7 @@ func (i *Inflector) Inflector(w http.ResponseWriter, r *http.Request) {
 					zap.String("op", op),
 					zap.String("inflected", unsafe.String(unsafe.SliceData(inflected), len(inflected))))
 
-				err = conn.WriteMessage(websocket.TextMessage, inflected)
-				if err != nil {
+				if err = conn.WriteMessage(websocket.TextMessage, inflected); err != nil {
 					i.log.Error("Failed to write message",
 						zap.String("op", op),
 						zap.Error(err))
